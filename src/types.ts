@@ -9,9 +9,9 @@ export type Review={id:string;created:number;count:number;files:number;downloade
 export type Confirmation={id:string;path:string;action:'delete'|'recycle';count:number;preparedAt:number};
 export type Preferences={autoStart:boolean;startMinimized:boolean;pauseSync:boolean};
 export type Drive={absolutePath?:string;id:string;accountId:string;path:string;letter:string;status:string};
-export type Account={id:string;name:string;scope:'personal'|'team';accountType?:'business'|'personal';settings:Settings;jobs:Job[];scheduleMinutes:number;paused:boolean;nextRun:number|null;native?:NativeState;maintenance?:{total:number;removed:number;pending:number}};
+export type Account={id:string;name:string;needsLogin?:boolean;scope:'personal'|'team';accountType?:'business'|'personal';settings:Settings;jobs:Job[];scheduleMinutes:number;paused:boolean;nextRun:number|null;native?:NativeState;maintenance?:{total:number;removed:number;pending:number}};
 export type Activity={accountId:string;status:string;path:string;stats:{bytes:number;totalBytes:number;speed:number;transfers:number;totalTransfers:number}|null};
-export type State={profilePath?:string;accounts:Account[];rcloneVersion:string|null;platform:string;nativeProvider:boolean;language:Language;activity:Activity|null;version:string;preferences:Preferences;drives:Drive[];trayStatus:string};
+export type State={vaultRecovery?:{source:'backup'|'mirror'|'new';problem:string;accounts:string[]}|null;profilePath?:string;accounts:Account[];rcloneVersion:string|null;platform:string;nativeProvider:boolean;language:Language;activity:Activity|null;version:string;preferences:Preferences;drives:Drive[];trayStatus:string};
 export type Plan={token:string;expires:number;strategy:'remote'|'local';jobs:{id:string;path:string;localPath:string;initialization:boolean;recovery:boolean;backupRemote:string;backupLocal:string}[];deferred:{path:string;reason:string}[];log:string};
 export type FileEvent={seq:number;id:string;time:string;path:string;kind:'file'|'folder';action:string;direction:string;status:string;size:number|null;detail:string;target:string};
 export type EventPage={entries:FileEvent[];next:number|null};
@@ -30,7 +30,7 @@ export interface Bridge{
   resetApp(confirmed:boolean):Promise<State>;cleanupLegacy(id:string):Promise<State>;
   enableNativeRoot(id:string):Promise<State>;chooseNativeRoot(id:string):Promise<State>;refreshNative(id:string):Promise<State>;nativeItem(id:string,path:string):Promise<string|null>;
   nativeAvailability(id:string,path:string,mode:Mode):Promise<State>;
-  nativeReview(id:string,action:'apply'|'restore'|'confirm'|'cancel',operationId?:string):Promise<State>;openQuarantine(id:string):Promise<void>;showInFolder(id:string,path:string):Promise<void>;
+  nativeReview(id:string,action:'apply'|'restore'|'confirm'|'cancel',operationId?:string):Promise<State>;openQuarantine(id:string):Promise<void>;relogin(id:string):Promise<State>;dismissRecovery():Promise<State>;showInFolder(id:string,path:string):Promise<void>;
   nativeItems(id:string,paths:string[]):Promise<Record<string,string>>;
   chooseDriveFolder(id:string):Promise<string|null>;driveLetters():Promise<{drives:{letter:string;available:boolean;target?:string}[]}>;createDrive(id:string,path:string,letter:string):Promise<State>;removeDrive(id:string):Promise<State>;
 }

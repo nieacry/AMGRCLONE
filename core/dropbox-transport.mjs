@@ -106,6 +106,8 @@ export class DropboxTransport {
       throw error;
     }
   }
+  // Disables the token and its refresh token at Dropbox (roadmap 2.6). Best effort.
+  async revoke(){const signal=AbortSignal.any([this.abort.signal,AbortSignal.timeout(15000)]);const response=await fetch('https://api.dropboxapi.com/2/auth/token/revoke',{method:'POST',headers:{Authorization:'Bearer '+await this.auth()},signal});if(!response.ok&&response.status!==401)throw await responseError(response);}
   // Brings back a deleted file at its old path, at the revision this computer last knew.
   async restore(item){return entry(await this.request('files/restore',{path:remotePath(item.path),rev:item.rev}));}
   async createFolder(relative){return entry((await this.request('files/create_folder_v2',{path:remotePath(relative),autorename:false})).metadata);}

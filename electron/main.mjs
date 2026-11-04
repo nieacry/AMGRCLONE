@@ -10,6 +10,7 @@ import {archiveMissingRoot,archiveResetRoot} from '../core/account-recovery.mjs'
 import {cleanLegacyMarkers,markerSummary} from '../core/legacy-markers.mjs';
 import {NativeProviders} from '../core/native-provider.mjs';
 import {diagnosticReport} from '../core/diagnostics.mjs';
+import {readVault,writeVault} from '../core/vault-file.mjs';
 import {release as osRelease} from 'node:os';
 import {DropboxTransport,LocalTransport} from '../core/dropbox-transport.mjs';
 import {SubstDrives} from '../core/subst-drives.mjs';
@@ -27,7 +28,7 @@ import { SyncEngine, settingsHash } from '../core/sync-engine.mjs';
 const exec=promisify(execFile),here=path.dirname(fileURLToPath(import.meta.url));
 const entry=pathToFileURL(path.join(here,'../dist/index.html')).href;
 let window,vault,dataDir,runtimeDir,activeChild,store,engine,scheduler,providers,drives,desktop,driveBackend,maintenanceRemote;
-let journalMaintenance;let persistQueue=Promise.resolve();const dirtyAccounts=new Set(),watchers=new Map(),accountRootErrors=new Map();
+let journalMaintenance,vaultRecovery=null;let persistQueue=Promise.resolve();const dirtyAccounts=new Set(),watchers=new Map(),accountRootErrors=new Map();
 let queue=Promise.resolve(),pending=0,rcloneVersion=null,quitting=false;
 const isolated=process.env.CLOUDLANE_TEST_DATA;
 const profileDir=isolated?path.resolve(isolated):path.join(app.getPath('documents'),'AMGRCLONE');
@@ -63,13 +64,24 @@ function run(args,{binary=vault?.binary||'rclone',timeout=120000,onLog,secret=fa
 }
 async function encrypt(text){if(safeStorage.isAsyncEncryptionAvailable){if(!await safeStorage.isAsyncEncryptionAvailable())throw new Error('err.keys');return safeStorage.encryptStringAsync(text);}if(!safeStorage.isEncryptionAvailable())throw new Error('err.keys');return safeStorage.encryptString(text);}
 async function decrypt(bytes){return safeStorage.decryptStringAsync?(await safeStorage.decryptStringAsync(bytes)).result:safeStorage.decryptString(bytes);}
-async function persist(){const result=persistQueue.then(async()=>{await writeFile(path.join(dataDir,'vault.next'),await encrypt(JSON.stringify(vault)),{mode:0o600});await rename(path.join(dataDir,'vault.next'),path.join(dataDir,'vault.bin'));});persistQueue=result.catch(()=>{});return result;}
+async function persist(){const result=persistQueue.then(()=>writeVault({dataDir,vault,encrypt}));persistQueue=result.catch(()=>{});return result;}
 function account(id){const acc=vault.accounts.find(a=>a.id===id);if(!acc)throw new Error('err.account');return acc;}
-function nativeState(acc){const value=providers?.status(acc)||{enabled:false};return accountRootErrors.has(acc.id)?{...value,status:'error',error:accountRootErrors.get(acc.id)}:value;}
+function nativeState(acc){if(acc.needsLogin)return acc.native?.enabled?{enabled:true,root:acc.native.root,status:'pending'}:{enabled:false};const value=providers?.status(acc)||{enabled:false};return accountRootErrors.has(acc.id)?{...value,status:'error',error:accountRootErrors.get(acc.id)}:value;}
 async function usableAccessToken(acc){return currentConfigAccessToken(acc.config)||await nativeAuth(acc);}
-function publicState(){const accounts=vault.accounts.map(({id,name,settings,scope='personal',accountType,scheduleMinutes=0,paused=false,nextRun=null})=>({id,name,scope,accountType,settings,scheduleMinutes,paused,nextRun,native:nativeState(account(id)),maintenance:markerSummary(store.markerReceipts(id)),jobs:store.jobs(id).filter(j=>j.status!=='retired').map(j=>({path:j.remote_path,status:j.status,lastSuccess:j.last_success}))}));const preferences=vault.preferences;return {accounts,profilePath:dataDir,rcloneVersion,version:app.getVersion(),platform:process.platform,nativeProvider:process.platform==='win32',language:vault.language,activity:engine.activity,preferences,drives:(vault.drives||[]).map(({id,accountId,path:relative,root,letter,status})=>({id,accountId,path:relative,absolutePath:path.join(root,...relative.split('/')),letter,status})),trayStatus:statusFor(accounts,engine.activity,preferences,dirtyAccounts)};}
+function publicState(){const accounts=vault.accounts.map(({id,name,settings,scope='personal',accountType,scheduleMinutes=0,paused=false,nextRun=null,needsLogin=false})=>({id,name,scope,accountType,settings,scheduleMinutes,paused,nextRun,needsLogin,native:nativeState(account(id)),maintenance:markerSummary(store.markerReceipts(id)),jobs:store.jobs(id).filter(j=>j.status!=='retired').map(j=>({path:j.remote_path,status:j.status,lastSuccess:j.last_success}))}));const preferences=vault.preferences;return {accounts,vaultRecovery,profilePath:dataDir,rcloneVersion,version:app.getVersion(),platform:process.platform,nativeProvider:process.platform==='win32',language:vault.language,activity:engine.activity,preferences,drives:(vault.drives||[]).map(({id,accountId,path:relative,root,letter,status})=>({id,accountId,path:relative,absolutePath:path.join(root,...relative.split('/')),letter,status})),trayStatus:statusFor(accounts,engine.activity,preferences,dirtyAccounts)};}
 async function savePreferences(input){for(const [key,value]of Object.entries(input)){if(!['autoStart','startMinimized','pauseSync'].includes(key)||typeof value!=='boolean')throw new Error('err.settings');}const next={...vault.preferences,...input};if(input.autoStart!==undefined)desktop?.applyLoginSettings(next);vault.preferences=next;if(providers&&input.pauseSync!==undefined)providers.setPaused(next.pauseSync);await persist();desktop?.update();return publicState();}
 function watchClassic(acc){watchers.get(acc.id)?.close();watchers.delete(acc.id);if(!acc.settings.localRoot||acc.native?.enabled)return;try{const watcher=watch(acc.settings.localRoot,{recursive:true},()=>{if(!engine.activity)dirtyAccounts.add(acc.id);});watcher.on('error',()=>dirtyAccounts.add(acc.id));watchers.set(acc.id,watcher);}catch{dirtyAccounts.add(acc.id);}}
+// Roadmap 2.5: one Dropbox account may be connected once. Two app accounts on the same Dropbox
+// would sync it twice and pass deletions between their folders.
+async function dropboxIdentity(accessToken){const remote=new DropboxTransport({auth:async()=>accessToken});try{const profile=await remote.accountProfile(accessToken);if(typeof profile.account_id!=='string')throw new Error('err.accountRoot');return profile.account_id;}finally{remote.cancel();}}
+async function assertNewDropboxAccount(identity,exceptId){
+  for(const other of vault.accounts){
+    if(other.id===exceptId||!other.config||!/^type\s*=\s*dropbox$/m.test(other.config))continue;
+    if(!other.dropboxAccountId){try{other.dropboxAccountId=await dropboxIdentity(await usableAccessToken(other));}catch{continue;}}
+    if(other.dropboxAccountId===identity)throw Object.assign(new Error('err.accountDuplicate'),{detail:other.name});
+  }
+}
+function notify(body){if(!Notification.isSupported())return;const notice=new Notification({title:'AMG rclone UI',body});notice.on('click',showWindow);notice.show();}
 // A mass deletion waiting for this user's decision: a Windows notification that opens the window.
 const notifiedReviews=new Set();
 function notifyReview(acc,{inbound,outbound}){const id=(inbound||outbound)?.id;if(!id||notifiedReviews.has(id))return;notifiedReviews.add(id);desktop?.update();if(!Notification.isSupported())return;const count=inbound?inbound.items.length:(outbound.remoteBaseline||outbound.items).length;const notice=new Notification({title:'AMG rclone UI · '+acc.name,body:t(inbound?'reviewInboundNotice':'reviewOutboundNotice',{count,path:outbound?.path||''})});notice.on('click',showWindow);notice.show();}
@@ -78,14 +90,17 @@ async function nativeAuth(acc){if(quitting)throw new Error('err.canceled');retur
 async function withConfig(acc,callback){const filename=path.join(runtimeDir,`session-${randomUUID()}.conf`);await writeFile(filename,acc.config,{flag:'wx',mode:0o600});try{return await callback(['--config',filename,'--ask-password=false']);}finally{try{acc.config=await readFile(filename,'utf8');await persist();}finally{await unlink(filename);}}}
 async function version(binary){const {stdout}=await run(['version'],{binary,timeout:15000});const match=stdout.match(/^rclone v(\d+)\.(\d+)\.(\d+)/);if(!match||+match[1]<1||(+match[1]===1&&+match[2]<70))throw new Error('err.version');return match[0];}
 function enqueue(task){pending++;const result=queue.then(task);queue=result.catch(()=>{}).finally(()=>pending--);return result;}
-function register(name,handler,serialized=true){ipcMain.handle('cloudlane:'+name,async(event,...args)=>{if(event.sender!==window?.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame.url!==entry)throw new Error(t('err.sender'));try{return await(serialized?enqueue(()=>handler(...args)):handler(...args));}catch(error){throw new Error(t(messages.en[error.message]?error.message:'err.operation'));}});}
+function register(name,handler,serialized=true){ipcMain.handle('cloudlane:'+name,async(event,...args)=>{if(event.sender!==window?.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame.url!==entry)throw new Error(t('err.sender'));try{return await(serialized?enqueue(()=>handler(...args)):handler(...args));}catch(error){throw new Error(t(messages.en[error.message]?error.message:'err.operation')+(error.detail?' ('+error.detail+')':''));}});}
 function invalidateSchedule(acc){acc.scheduleMinutes=0;acc.nextRun=null;engine.plans.clear();}
 async function initialize(){
   dataDir=app.getPath('userData');const profileUpgrade=await prepareProfile({dataDir,version:app.getVersion()});runtimeDir=path.join(dataDir,'runtime');await mkdir(runtimeDir,{recursive:true,mode:0o700});
   if(process.platform==='win32'){const {stdout}=await exec('whoami.exe',['/user','/fo','csv','/nh'],{windowsHide:true});const sid=stdout.match(/S-1-[\d-]+/)?.[0];if(!sid)throw new Error('err.permissions');await exec('icacls.exe',[runtimeDir,'/inheritance:r','/grant:r',`*${sid}:(OI)(CI)F`],{windowsHide:true});}
   for(const file of await readdir(runtimeDir))if(/^session-[\da-f-]+\.conf$/.test(file))await unlink(path.join(runtimeDir,file));
   const devBinary=app.isPackaged?path.join(process.resourcesPath,'bin',process.platform==='win32'?'rclone.exe':'rclone'):path.join(app.getAppPath(),'.runtime','tools',process.platform==='win32'?'rclone.exe':'rclone'),devExists=await stat(devBinary).then(s=>s.isFile()).catch(()=>false);
-  try{vault=JSON.parse(await decrypt(await readFile(path.join(dataDir,'vault.bin'))));}catch(error){if(error.code!=='ENOENT')throw new Error('err.vault');vault={accounts:[],binary:devExists?devBinary:'rclone'};}
+  // Roadmap 2.2: a damaged or undecryptable vault no longer stops the app. vault.bak is tried
+  // next, then settings-backup.json (accounts come back and only need a new Dropbox sign-in).
+  const loaded=await readVault({dataDir,decrypt});vault=loaded.vault||{accounts:[]};vault.binary=vault.binary||(devExists?devBinary:'rclone');
+  if(loaded.problem)vaultRecovery={source:loaded.source,problem:loaded.problem,accounts:vault.accounts.filter(a=>a.needsLogin).map(a=>a.name)};
   vault.binaryMode=bundledBinaryMode(vault,devBinary);if(vault.binaryMode==='bundled'&&devExists)vault.binary=devBinary;
   vault.language=vault.language==='en'?'en':'uk';vault.preferences={autoStart:false,startMinimized:false,pauseSync:false,...vault.preferences};vault.drives=vault.drives||[];
   try{rcloneVersion=await version(vault.binary);}catch{if(devExists)try{rcloneVersion=await version(devBinary);vault.binary=devBinary;}catch{/* Setup in UI. */}}
@@ -97,7 +112,7 @@ async function initialize(){
   drives=new OwnedDrives({records:vault.drives,account,backend:driveBackend,persist,resolveFolder:async(acc,relative)=>{const configured=acc.native?.enabled?acc.native.root:acc.settings.localRoot;if(!configured)throw new Error('err.root');const root=await realpath(configured),target=await realpath(path.join(root,...relative.split('/'))).catch(()=>{throw new Error('err.driveLocalFolder');});const inside=path.relative(root,target);if(!(await stat(target)).isDirectory()||inside.startsWith('..')||path.isAbsolute(inside))throw new Error('err.link');return {root,target};}});
   for(const acc of vault.accounts){if(store.jobs(acc.id).some(j=>j.status==='needsReview'))acc.paused=true;watchClassic(acc);}
   desktop=createDesktop({state:publicState,t,show:showWindow,quit:()=>app.quit(),savePreferences,isolated});desktop.applyLoginSettings(vault.preferences);
-  for(const acc of vault.accounts)if(acc.native?.enabled)enqueue(async()=>{await ensureAccountRoot(acc);await providers.start(acc);if(!acc.native.resetting&&!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}).catch(()=>{});
+  for(const acc of vault.accounts)if(acc.native?.enabled&&!acc.needsLogin)enqueue(async()=>{await ensureAccountRoot(acc);await providers.start(acc);if(!acc.native.resetting&&!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}).catch(()=>{});
   if(vault.drives.length)drives.restore().catch(()=>{});
   register('state',publicState,false);
   register('exportDiagnostics',async()=>{
@@ -155,17 +170,17 @@ async function initialize(){
   register('enableNativeRoot',async id=>{const acc=account(id);if(!acc.settings.localRoot)throw new Error('err.root');return activateNativeRoot(acc,acc.settings.localRoot);});
   register('refreshNative',async id=>{const acc=account(id);await ensureAccountRoot(acc);if(!acc.native?.enabled)throw new Error('err.nativeRequired');backgroundNativeRefresh(acc);return publicState();});
   register('resetApp',async confirmed=>{
-    if(confirmed!==true)throw new Error('err.confirm');if(engine.activity)throw new Error('err.resetBusy');
+    if(confirmed!==true)throw new Error('err.confirm');if(engine.activity)throw new Error('err.resetBusy');let resetStage='prepare';
     for(const acc of vault.accounts)if(acc.native?.enabled){acc.native.resetting=true;acc.native.resetMode='keepDownloaded';providers.cancelAccount(acc.id);}await persist();
     try{
-      for(const acc of vault.accounts)if(acc.native?.enabled){await detachNative(acc,true);}
-      await drives.disconnect();
+      resetStage='detach';for(const acc of vault.accounts)if(acc.native?.enabled){await detachNative(acc,true);}
+      resetStage='drives';await drives.disconnect();
       for(const record of vault.drives){const current=(await driveBackend.list()).find(d=>d.letter===record.letter);if(current&&!current.available&&current.target.toLowerCase()===drives.expected(record).toLowerCase())throw new Error('err.driveOwnership');}
-      desktop.applyLoginSettings({...vault.preferences,autoStart:false});for(const watcher of watchers.values())watcher.close();watchers.clear();dirtyAccounts.clear();
-      await session.defaultSession.clearStorageData();await session.defaultSession.clearCache();
-      for(const name of ['native-cache','previews','sync']){const target=path.resolve(dataDir,name),relative=path.relative(path.resolve(dataDir),target);if(relative!==name)throw new Error('err.reset');await rm(target,{recursive:true,force:true});}
-      await journalMaintenance.close();try{store.reset();}finally{journalMaintenance.start();}engine.plans.clear();vault={accounts:[],language:'uk',preferences:{autoStart:false,startMinimized:false,pauseSync:false},drives:[],binary:devExists?devBinary:'rclone'};providers.paused=false;drives.records=vault.drives;await persist();desktop.update();return publicState();
-    }catch(error){throw new Error('err.reset');}
+      resetStage='autostart';desktop.applyLoginSettings({...vault.preferences,autoStart:false});for(const watcher of watchers.values())watcher.close();watchers.clear();dirtyAccounts.clear();
+      resetStage='browser-storage';await session.defaultSession.clearStorageData();await session.defaultSession.clearCache();
+      resetStage='files';for(const name of ['native-cache','previews','sync']){const target=path.resolve(dataDir,name),relative=path.relative(path.resolve(dataDir),target);if(relative!==name)throw new Error('err.reset');await rm(target,{recursive:true,force:true});}
+      resetStage='database';await journalMaintenance.close();try{store.reset();}finally{journalMaintenance.start();}engine.plans.clear();vault={accounts:[],language:'uk',preferences:{autoStart:false,startMinimized:false,pauseSync:false},drives:[],binary:devExists?devBinary:'rclone'};providers.paused=false;drives.records=vault.drives;await persist();desktop.update();return publicState();
+    }catch(error){throw Object.assign(new Error('err.reset'),{detail:[resetStage,error.message?.startsWith('err.')?t(error.message):error.code||error.message].filter(Boolean).join(': ').slice(0,200)});}
   });
   register('cleanupLegacy',async id=>{await cleanupLegacy(account(id));return publicState();});
   register('nativeAvailability',async(id,relative,mode)=>{const acc=account(id);await ensureAccountRoot(acc);validateRemotePath(relative);if(!acc.native?.enabled||!['local','online'].includes(mode))throw new Error('err.nativeRequired');providers.availability(acc,relative,mode).catch(()=>{});return publicState();});
@@ -181,11 +196,15 @@ async function initialize(){
   register('setLanguage',async language=>{if(!['uk','en'].includes(language))throw new Error('err.language');vault.language=language;await persist();return publicState();});
   register('setScope',async(id,scope)=>{const acc=account(id);if(/^type\s*=\s*dropbox$/m.test(acc.config))throw new Error('err.accountRootManaged');if(acc.native?.enabled)throw new Error('err.nativeExclusive');if(!['personal','team'].includes(scope))throw new Error('err.settings');if(store.jobs(id).some(j=>j.initialized||j.status!=='new'))throw new Error('err.scope');acc.scope=scope;acc.settings.rules={};store.db.prepare('DELETE FROM jobs WHERE account_id=?').run(id);invalidateSchedule(acc);await persist();return publicState();});
   register('chooseRclone',async()=>{const result=await dialog.showOpenDialog(window,{title:t('chooseRclone'),properties:['openFile'],filters:process.platform==='win32'?[{name:'rclone',extensions:['exe']}]:[]});if(!result.canceled){const binary=result.filePaths[0],checked=await version(binary);vault.binary=binary;vault.binaryMode='custom';rcloneVersion=checked;await persist();}return publicState();});
-  register('login',async name=>{if(typeof name!=='string'||!name.trim()||name.length>80)throw new Error('err.name');if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const acc={id:randomUUID(),name:name.trim(),config:`[cloud]\ntype = dropbox\ntoken = ${token}\n`,settings:{localRoot:'',rules:{}},scheduleMinutes:0};vault.accounts.push(acc);await persist();await ensureAccountRoot(acc);return publicState();});
+  // Signs an existing account in again (after a vault restored from settings-backup.json). The
+  // Dropbox account must be the same one: its folders, rules and catalog belong to it.
+  register('relogin',async id=>{const acc=account(id);if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const identity=await dropboxIdentity(JSON.parse(token).access_token);if(acc.dropboxAccountId&&identity!==acc.dropboxAccountId)throw new Error('err.accountMismatch');await assertNewDropboxAccount(identity,acc.id);acc.dropboxAccountId=identity;acc.config=`[cloud]\ntype = dropbox\ntoken = ${token}\n`;delete acc.needsLogin;await persist();if(vaultRecovery){vaultRecovery.accounts=vault.accounts.filter(a=>a.needsLogin).map(a=>a.name);if(!vaultRecovery.accounts.length)vaultRecovery=null;}if(acc.native?.enabled){await ensureAccountRoot(acc);await providers.start(acc);if(!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}return publicState();});
+  register('dismissRecovery',()=>{vaultRecovery=null;return publicState();},false);
+  register('login',async name=>{if(typeof name!=='string'||!name.trim()||name.length>80)throw new Error('err.name');if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const dropboxAccountId=await dropboxIdentity(JSON.parse(token).access_token);await assertNewDropboxAccount(dropboxAccountId);const acc={id:randomUUID(),name:name.trim(),dropboxAccountId,config:`[cloud]\ntype = dropbox\ntoken = ${token}\n`,settings:{localRoot:'',rules:{}},scheduleMinutes:0};vault.accounts.push(acc);await persist();await ensureAccountRoot(acc);return publicState();});
   register('removeAccount',async(id,confirmed=false)=>{
     const acc=account(id);if(confirmed!==true)throw new Error('err.confirm');
     if(acc.native?.enabled){acc.native.resetting=true;acc.native.resetMode='keepDownloaded';providers.cancelAccount(acc.id);invalidateSchedule(acc);await persist();await detachNative(acc,true);}
-    await disconnectOwnedDrives(acc);watchers.get(id)?.close();watchers.delete(id);dirtyAccounts.delete(id);vault.accounts=vault.accounts.filter(a=>a.id!==id);engine.plans.clear();await persist();return publicState();
+    await disconnectOwnedDrives(acc);watchers.get(id)?.close();watchers.delete(id);dirtyAccounts.delete(id);const revoke=acc.config&&/^type\s*=\s*dropbox$/m.test(acc.config)?new DropboxTransport({auth:()=>usableAccessToken(acc)}):null;await revoke?.revoke().catch(()=>{});revoke?.cancel();vault.accounts=vault.accounts.filter(a=>a.id!==id);engine.plans.clear();await persist();store.forgetAccount(id);return publicState();
   });
   register('list',async(id,remotePath)=>{
     validateRemotePath(remotePath);const acc=account(id);await ensureAccountRoot(acc);
@@ -215,7 +234,7 @@ async function initialize(){
   register('setSchedule',async(id,minutes,paused=false)=>{const acc=account(id);if(acc.native?.enabled)throw new Error('err.nativeExclusive');if(![0,5,15,30,60].includes(minutes)||typeof paused!=='boolean')throw new Error('err.settings');if(minutes){const planned=makePlan(acc.settings),jobs=store.jobs(id);if(!planned.jobs.length||planned.jobs.some(p=>!jobs.some(j=>j.remote_path===p.path&&j.initialized&&j.status==='idle')))throw new Error('err.schedule');}acc.scheduleMinutes=minutes;acc.paused=paused;acc.nextRun=minutes?Date.now()+minutes*60000:null;await persist();return publicState();});
   register('cancel',id=>{if(id!==undefined){account(id);providers.cancelAccount(id);if(engine.activity?.accountId===id){engine.cancel();activeChild?.kill();}return true;}maintenanceRemote?.cancel();providers.cancel();engine.cancel();activeChild?.kill();return true;},false);
   await persist();await commitProfile({dataDir,version:app.getVersion(),upgrade:profileUpgrade});
-  scheduler=setInterval(()=>{if(quitting||pending||engine.activity||vault.preferences.pauseSync)return;const acc=vault.accounts.find(a=>!a.native?.enabled&&a.scheduleMinutes&&!a.paused&&a.nextRun&&a.nextRun<=Date.now());if(!acc)return;enqueue(async()=>{try{const plan=await engine.preview(acc);if(plan.jobs.some(j=>j.initialization))throw new Error('err.schedule');await engine.execute(acc,plan.token,true);dirtyAccounts.delete(acc.id);acc.nextRun=Date.now()+acc.scheduleMinutes*60000;}catch{acc.paused=true;}finally{await persist();}}).catch(()=>{});},15000);
+  scheduler=setInterval(()=>{if(quitting||pending||engine.activity||vault.preferences.pauseSync)return;const acc=vault.accounts.find(a=>!a.native?.enabled&&a.scheduleMinutes&&!a.paused&&a.nextRun&&a.nextRun<=Date.now());if(!acc)return;enqueue(async()=>{try{const plan=await engine.preview(acc);if(plan.jobs.some(j=>j.initialization))throw new Error('err.schedule');await engine.execute(acc,plan.token,true);dirtyAccounts.delete(acc.id);acc.nextRun=Date.now()+acc.scheduleMinutes*60000;}catch{acc.paused=true;notify(t('schedulePausedNotice',{name:acc.name}));desktop?.update();}finally{await persist();}}).catch(()=>{});},15000);
 }
 async function createWindow(){
   Menu.setApplicationMenu(process.platform==='darwin'?Menu.buildFromTemplate([{role:'appMenu'},{role:'editMenu'},{role:'windowMenu'}]):null);session.defaultSession.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));

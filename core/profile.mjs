@@ -7,7 +7,7 @@ import {DATABASE_SCHEMA} from './store.mjs';
 
 export const PROFILE_FORMAT=1;
 export const MINIMUM_APP_VERSION='0.15.0';
-const profileFiles=['vault.bin','sync.sqlite','sync.sqlite-wal','sync.sqlite-shm','Local State','profile-state.json','sync','native-cache','recovery','profile-backups'];
+const profileFiles=['vault.bin','vault.bak','settings-backup.json','sync.sqlite','sync.sqlite-wal','sync.sqlite-shm','Local State','profile-state.json','sync','native-cache','recovery','profile-backups'];
 function hashFileSync(filename){const hash=createHash('sha256'),file=openSync(filename,'r'),buffer=Buffer.alloc(1024*1024);try{let size;while((size=readSync(file,buffer))>0)hash.update(buffer.subarray(0,size));return hash.digest('hex');}finally{closeSync(file);}}
 async function hashFile(filename){const hash=createHash('sha256');for await(const bytes of createReadStream(filename))hash.update(bytes);return hash.digest('hex');}
 // Called before Chromium/safeStorage initialize. The old profile's singleton lock is held.

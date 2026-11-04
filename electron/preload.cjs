@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('cloudlane', Object.freeze({
   removeDrive: id => invoke('removeDrive', id),
   chooseRclone: () => invoke('chooseRclone'),
   login: name => invoke('login', name),
+  relogin: id => invoke('relogin', id),
+  dismissRecovery: () => invoke('dismissRecovery'),
   removeAccount: (id, confirmed) => invoke('removeAccount', id, confirmed),
   list: (id, path) => invoke('list', id, path),
   chooseRoot: id => invoke('chooseRoot', id),
