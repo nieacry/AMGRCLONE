@@ -7,6 +7,8 @@ test-results/
 native/bin/
 publish/
 versions/
+# Generated macOS handoff package (0.15.6 source snapshot + zip); its docs move to docs/mac in stage 5
+macbuild/
 
 # Local tooling and editor state
 .vs/

@@ -3,7 +3,9 @@ import {EventEmitter} from 'node:events';
 import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
 
-export const retryableNativeError=error=>['0x80070322','0x80070020','0x80070021'].includes(error.nativeCode?.toLowerCase());
+// Locked/busy files (Windows) and temporary Dropbox failures (rate limits, 5xx, network)
+// are retried by the next cycle instead of being reported as errors.
+export const retryableNativeError=error=>error?.retryable===true||['0x80070322','0x80070020','0x80070021'].includes(error?.nativeCode?.toLowerCase());
 
 export class NativeHost extends EventEmitter {
   constructor(binary){super();this.pending=new Map();this.child=spawn(binary,[],{windowsHide:true,shell:false,stdio:['pipe','pipe','pipe']});this.closed=false;this.closing=false;this.child.stdin.on('error',()=>{});this.child.stderr.on('data',()=>{});
