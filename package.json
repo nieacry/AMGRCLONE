@@ -1,6 +1,6 @@
 {
   "name": "cloudlane",
-  "version": "0.16.5",
+  "version": "0.21.0",
   "private": true,
   "description": "Multi-account Dropbox desktop client powered by rclone",
   "author": "Cloudlane contributors",
