@@ -28,3 +28,11 @@ test('diagnostic export requests bounded errors and skips and retains empty acco
   let calls=0;const report=diagnosticReport({state:{accounts:[{id:'empty',name:'Empty',scope:'personal'}]},store:{fileEvents(id,options){calls++;assert.equal(id,'empty');assert.ok(['failed','skipped'].includes(options.status));assert.equal(options.limit,100);return {entries:[]};}}});
   assert.equal(calls,2);assert.deepEqual(report.accounts[0].recentErrors,[]);assert.equal(report.accounts[0].provider.enabled,false);
 });
+
+test('a report names the computer and Windows user it came from (five computers share one Dropbox)',async()=>{
+  const {currentDevice}=await import('../core/diagnostics.mjs');
+  const store=new SyncStore(':memory:');
+  const report=diagnosticReport({state:{version:'0.17.0',platform:'win32',rcloneVersion:'rclone v1.70.0',accounts:[]},store,arch:'x64',osVersion:'10.0',device:{computer:'ART-03',user:'anna'}});
+  assert.deepEqual(report.device,{computer:'ART-03',user:'anna'});
+  const own=currentDevice();assert.equal(typeof own.computer,'string');assert.ok(own.computer.length>0);assert.doesNotMatch(own.computer,/[<>:"\/\\|?*]/);
+});

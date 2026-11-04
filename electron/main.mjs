@@ -11,6 +11,7 @@ import {cleanLegacyMarkers,markerSummary} from '../core/legacy-markers.mjs';
 import {NativeProviders} from '../core/native-provider.mjs';
 import {diagnosticReport} from '../core/diagnostics.mjs';
 import {readVault,writeVault} from '../core/vault-file.mjs';
+import {TaskQueues} from '../core/task-queue.mjs';
 import {release as osRelease} from 'node:os';
 import {DropboxTransport,LocalTransport} from '../core/dropbox-transport.mjs';
 import {SubstDrives} from '../core/subst-drives.mjs';
@@ -29,7 +30,7 @@ const exec=promisify(execFile),here=path.dirname(fileURLToPath(import.meta.url))
 const entry=pathToFileURL(path.join(here,'../dist/index.html')).href;
 let window,vault,dataDir,runtimeDir,activeChild,store,engine,scheduler,providers,drives,desktop,driveBackend,maintenanceRemote;
 let journalMaintenance,vaultRecovery=null;let persistQueue=Promise.resolve();const dirtyAccounts=new Set(),watchers=new Map(),accountRootErrors=new Map();
-let queue=Promise.resolve(),pending=0,rcloneVersion=null,quitting=false;
+let rcloneVersion=null,quitting=false;const tasks=new TaskQueues();
 const isolated=process.env.CLOUDLANE_TEST_DATA;
 const profileDir=isolated?path.resolve(isolated):path.join(app.getPath('documents'),'AMGRCLONE');
 const legacyDir=isolated?(process.env.CLOUDLANE_LEGACY_TEST_DATA?path.resolve(process.env.CLOUDLANE_LEGACY_TEST_DATA):profileDir):path.join(app.getPath('appData'),'cloudlane');
@@ -46,10 +47,10 @@ const t=(key,values={})=>translate(vault?.language||'uk',key,values);
 const cleanEnv=()=>Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.toUpperCase().startsWith('RCLONE_')));
 const safeLog=value=>value.replace(/(access_token|refresh_token|Authorization)["\s:=]+[^\s,}\n]+/gi,'$1=[redacted]').slice(-1000000);
 
-function run(args,{binary=vault?.binary||'rclone',timeout=120000,onLog,secret=false}={}) {
+function run(args,{binary=vault?.binary||'rclone',timeout=120000,onLog,secret=false,track=true}={}) {
   return new Promise((resolve,reject)=>{
     const child=spawn(binary,args,{shell:false,windowsHide:true,env:cleanEnv(),stdio:['ignore','pipe','pipe']});
-    activeChild=child;let stdout='',stderr='',lineBuffer='',failure;
+    if(track)activeChild=child;let stdout='',stderr='',lineBuffer='',failure;
     const timer=setTimeout(()=>{failure=new Error('err.timeout');child.kill();},timeout);
     child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
     child.stdout.on('data',chunk=>{stdout+=chunk;if(stdout.length>32*1024*1024){failure=new Error('err.large');child.kill();}});
@@ -85,12 +86,16 @@ function notify(body){if(!Notification.isSupported())return;const notice=new Not
 // A mass deletion waiting for this user's decision: a Windows notification that opens the window.
 const notifiedReviews=new Set();
 function notifyReview(acc,{inbound,outbound}){const id=(inbound||outbound)?.id;if(!id||notifiedReviews.has(id))return;notifiedReviews.add(id);desktop?.update();if(!Notification.isSupported())return;const count=inbound?inbound.items.length:(outbound.remoteBaseline||outbound.items).length;const notice=new Notification({title:'AMG rclone UI · '+acc.name,body:t(inbound?'reviewInboundNotice':'reviewOutboundNotice',{count,path:outbound?.path||''})});notice.on('click',showWindow);notice.show();}
-async function nativeAuth(acc){if(quitting)throw new Error('err.canceled');return withConfig(acc,async flags=>{await run(['about','cloud:',...flags]);const config=await readFile(flags[1],'utf8'),line=config.match(/^token\s*=\s*(.+)$/m)?.[1];if(!line)throw new Error('err.oauth');const token=JSON.parse(line);return token.access_token;});}
+async function nativeAuth(acc){if(quitting)throw new Error('err.canceled');return withConfig(acc,async flags=>{await run(['about','cloud:',...flags],{track:false});const config=await readFile(flags[1],'utf8'),line=config.match(/^token\s*=\s*(.+)$/m)?.[1];if(!line)throw new Error('err.oauth');const token=JSON.parse(line);return token.access_token;});}
 
 async function withConfig(acc,callback){const filename=path.join(runtimeDir,`session-${randomUUID()}.conf`);await writeFile(filename,acc.config,{flag:'wx',mode:0o600});try{return await callback(['--config',filename,'--ask-password=false']);}finally{try{acc.config=await readFile(filename,'utf8');await persist();}finally{await unlink(filename);}}}
 async function version(binary){const {stdout}=await run(['version'],{binary,timeout:15000});const match=stdout.match(/^rclone v(\d+)\.(\d+)\.(\d+)/);if(!match||+match[1]<1||(+match[1]===1&&+match[2]<70))throw new Error('err.version');return match[0];}
-function enqueue(task){pending++;const result=queue.then(task);queue=result.catch(()=>{}).finally(()=>pending--);return result;}
-function register(name,handler,serialized=true){ipcMain.handle('cloudlane:'+name,async(event,...args)=>{if(event.sender!==window?.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame.url!==entry)throw new Error(t('err.sender'));try{return await(serialized?enqueue(()=>handler(...args)):handler(...args));}catch(error){throw new Error(t(messages.en[error.message]?error.message:'err.operation')+(error.detail?' ('+error.detail+')':''));}});}
+function enqueue(task,accountId){return tasks.run(task,accountId);}
+// Roadmap 3.6: these act on one account and run beside other accounts' work. Everything else
+// that is serialized changes shared state (account list, drives, language, bisync engine) and
+// waits for all accounts. login/relogin wait for the browser outside any queue.
+const ACCOUNT_SCOPED=new Set(['refreshNative','cleanupLegacy','nativeAvailability','nativeReview','list','saveSettings','setScope','setSchedule']),UNQUEUED=new Set(['login','relogin']);
+function register(name,handler,serialized=true){ipcMain.handle('cloudlane:'+name,async(event,...args)=>{if(event.sender!==window?.webContents||event.senderFrame!==window.webContents.mainFrame||event.senderFrame.url!==entry)throw new Error(t('err.sender'));try{return await(serialized&&!UNQUEUED.has(name)?enqueue(()=>handler(...args),ACCOUNT_SCOPED.has(name)&&typeof args[0]==='string'?args[0]:undefined):handler(...args));}catch(error){throw new Error(t(messages.en[error.message]?error.message:'err.operation')+(error.detail?' ('+error.detail+')':''));}});}
 function invalidateSchedule(acc){acc.scheduleMinutes=0;acc.nextRun=null;engine.plans.clear();}
 async function initialize(){
   dataDir=app.getPath('userData');const profileUpgrade=await prepareProfile({dataDir,version:app.getVersion()});runtimeDir=path.join(dataDir,'runtime');await mkdir(runtimeDir,{recursive:true,mode:0o700});
@@ -112,7 +117,7 @@ async function initialize(){
   drives=new OwnedDrives({records:vault.drives,account,backend:driveBackend,persist,resolveFolder:async(acc,relative)=>{const configured=acc.native?.enabled?acc.native.root:acc.settings.localRoot;if(!configured)throw new Error('err.root');const root=await realpath(configured),target=await realpath(path.join(root,...relative.split('/'))).catch(()=>{throw new Error('err.driveLocalFolder');});const inside=path.relative(root,target);if(!(await stat(target)).isDirectory()||inside.startsWith('..')||path.isAbsolute(inside))throw new Error('err.link');return {root,target};}});
   for(const acc of vault.accounts){if(store.jobs(acc.id).some(j=>j.status==='needsReview'))acc.paused=true;watchClassic(acc);}
   desktop=createDesktop({state:publicState,t,show:showWindow,quit:()=>app.quit(),savePreferences,isolated});desktop.applyLoginSettings(vault.preferences);
-  for(const acc of vault.accounts)if(acc.native?.enabled&&!acc.needsLogin)enqueue(async()=>{await ensureAccountRoot(acc);await providers.start(acc);if(!acc.native.resetting&&!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}).catch(()=>{});
+  for(const acc of vault.accounts)if(acc.native?.enabled&&!acc.needsLogin)enqueue(async()=>{await ensureAccountRoot(acc);await providers.start(acc);if(!acc.native.resetting&&!vault.preferences.pauseSync)backgroundNativeRefresh(acc);},acc.id).catch(()=>{});
   if(vault.drives.length)drives.restore().catch(()=>{});
   register('state',publicState,false);
   register('exportDiagnostics',async()=>{
@@ -198,9 +203,9 @@ async function initialize(){
   register('chooseRclone',async()=>{const result=await dialog.showOpenDialog(window,{title:t('chooseRclone'),properties:['openFile'],filters:process.platform==='win32'?[{name:'rclone',extensions:['exe']}]:[]});if(!result.canceled){const binary=result.filePaths[0],checked=await version(binary);vault.binary=binary;vault.binaryMode='custom';rcloneVersion=checked;await persist();}return publicState();});
   // Signs an existing account in again (after a vault restored from settings-backup.json). The
   // Dropbox account must be the same one: its folders, rules and catalog belong to it.
-  register('relogin',async id=>{const acc=account(id);if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const identity=await dropboxIdentity(JSON.parse(token).access_token);if(acc.dropboxAccountId&&identity!==acc.dropboxAccountId)throw new Error('err.accountMismatch');await assertNewDropboxAccount(identity,acc.id);acc.dropboxAccountId=identity;acc.config=`[cloud]\ntype = dropbox\ntoken = ${token}\n`;delete acc.needsLogin;await persist();if(vaultRecovery){vaultRecovery.accounts=vault.accounts.filter(a=>a.needsLogin).map(a=>a.name);if(!vaultRecovery.accounts.length)vaultRecovery=null;}if(acc.native?.enabled){await ensureAccountRoot(acc);await providers.start(acc);if(!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}return publicState();});
+  register('relogin',async id=>{const acc=account(id);if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true,track:false});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const identity=await dropboxIdentity(JSON.parse(token).access_token);return enqueue(async()=>{if(!vault.accounts.includes(acc))throw new Error('err.account');if(acc.dropboxAccountId&&identity!==acc.dropboxAccountId)throw new Error('err.accountMismatch');await assertNewDropboxAccount(identity,acc.id);acc.dropboxAccountId=identity;acc.config=`[cloud]\ntype = dropbox\ntoken = ${token}\n`;delete acc.needsLogin;await persist();if(vaultRecovery){vaultRecovery.accounts=vault.accounts.filter(a=>a.needsLogin).map(a=>a.name);if(!vaultRecovery.accounts.length)vaultRecovery=null;}if(acc.native?.enabled){await ensureAccountRoot(acc);await providers.start(acc);if(!vault.preferences.pauseSync)backgroundNativeRefresh(acc);}return publicState();});});
   register('dismissRecovery',()=>{vaultRecovery=null;return publicState();},false);
-  register('login',async name=>{if(typeof name!=='string'||!name.trim()||name.length>80)throw new Error('err.name');if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const dropboxAccountId=await dropboxIdentity(JSON.parse(token).access_token);await assertNewDropboxAccount(dropboxAccountId);const acc={id:randomUUID(),name:name.trim(),dropboxAccountId,config:`[cloud]\ntype = dropbox\ntoken = ${token}\n`,settings:{localRoot:'',rules:{}},scheduleMinutes:0};vault.accounts.push(acc);await persist();await ensureAccountRoot(acc);return publicState();});
+  register('login',async name=>{if(typeof name!=='string'||!name.trim()||name.length>80)throw new Error('err.name');if(!rcloneVersion)throw new Error('err.setup');await encrypt('availability-check');const result=await run(['authorize','dropbox','--config',path.join(runtimeDir,'unused.conf'),'--ask-password=false'],{timeout:300000,secret:true,track:false});const token=parseAuthorization(result.stdout+'\n'+result.stderr);const dropboxAccountId=await dropboxIdentity(JSON.parse(token).access_token);return enqueue(async()=>{await assertNewDropboxAccount(dropboxAccountId);const acc={id:randomUUID(),name:name.trim(),dropboxAccountId,config:`[cloud]\ntype = dropbox\ntoken = ${token}\n`,settings:{localRoot:'',rules:{}},scheduleMinutes:0};vault.accounts.push(acc);await persist();await ensureAccountRoot(acc);return publicState();});});
   register('removeAccount',async(id,confirmed=false)=>{
     const acc=account(id);if(confirmed!==true)throw new Error('err.confirm');
     if(acc.native?.enabled){acc.native.resetting=true;acc.native.resetMode='keepDownloaded';providers.cancelAccount(acc.id);invalidateSchedule(acc);await persist();await detachNative(acc,true);}
@@ -234,7 +239,7 @@ async function initialize(){
   register('setSchedule',async(id,minutes,paused=false)=>{const acc=account(id);if(acc.native?.enabled)throw new Error('err.nativeExclusive');if(![0,5,15,30,60].includes(minutes)||typeof paused!=='boolean')throw new Error('err.settings');if(minutes){const planned=makePlan(acc.settings),jobs=store.jobs(id);if(!planned.jobs.length||planned.jobs.some(p=>!jobs.some(j=>j.remote_path===p.path&&j.initialized&&j.status==='idle')))throw new Error('err.schedule');}acc.scheduleMinutes=minutes;acc.paused=paused;acc.nextRun=minutes?Date.now()+minutes*60000:null;await persist();return publicState();});
   register('cancel',id=>{if(id!==undefined){account(id);providers.cancelAccount(id);if(engine.activity?.accountId===id){engine.cancel();activeChild?.kill();}return true;}maintenanceRemote?.cancel();providers.cancel();engine.cancel();activeChild?.kill();return true;},false);
   await persist();await commitProfile({dataDir,version:app.getVersion(),upgrade:profileUpgrade});
-  scheduler=setInterval(()=>{if(quitting||pending||engine.activity||vault.preferences.pauseSync)return;const acc=vault.accounts.find(a=>!a.native?.enabled&&a.scheduleMinutes&&!a.paused&&a.nextRun&&a.nextRun<=Date.now());if(!acc)return;enqueue(async()=>{try{const plan=await engine.preview(acc);if(plan.jobs.some(j=>j.initialization))throw new Error('err.schedule');await engine.execute(acc,plan.token,true);dirtyAccounts.delete(acc.id);acc.nextRun=Date.now()+acc.scheduleMinutes*60000;}catch{acc.paused=true;notify(t('schedulePausedNotice',{name:acc.name}));desktop?.update();}finally{await persist();}}).catch(()=>{});},15000);
+  scheduler=setInterval(()=>{if(quitting||tasks.pending||engine.activity||vault.preferences.pauseSync)return;const acc=vault.accounts.find(a=>!a.native?.enabled&&a.scheduleMinutes&&!a.paused&&a.nextRun&&a.nextRun<=Date.now());if(!acc)return;enqueue(async()=>{try{const plan=await engine.preview(acc);if(plan.jobs.some(j=>j.initialization))throw new Error('err.schedule');await engine.execute(acc,plan.token,true);dirtyAccounts.delete(acc.id);acc.nextRun=Date.now()+acc.scheduleMinutes*60000;}catch{acc.paused=true;notify(t('schedulePausedNotice',{name:acc.name}));desktop?.update();}finally{await persist();}}).catch(()=>{});},15000);
 }
 async function createWindow(){
   Menu.setApplicationMenu(process.platform==='darwin'?Menu.buildFromTemplate([{role:'appMenu'},{role:'editMenu'},{role:'windowMenu'}]):null);session.defaultSession.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));
@@ -242,6 +247,6 @@ async function createWindow(){
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-navigate',event=>event.preventDefault());window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});window.once('ready-to-show',()=>{if(!vault.preferences.startMinimized)window.show();});await window.loadURL(entry);
 }
 if(primary)app.whenReady().then(async()=>{if(profileMigrationError)throw profileMigrationError;await initialize();await createWindow();}).catch(error=>{dialog.showErrorBox('AMG rclone UI',t(messages.en[error.message]?error.message:'err.operation'));app.quit();});
-app.on('before-quit',event=>{if(quitting)return;event.preventDefault();quitting=true;clearInterval(scheduler);engine?.cancel();activeChild?.kill();maintenanceRemote?.cancel();providers?.cancel();for(const watcher of watchers.values())watcher.close();Promise.resolve(queue).then(async()=>{await providers?.close();await journalMaintenance?.close();await persistQueue;}).finally(()=>{desktop?.stop();store?.close();app.quit();});});
+app.on('before-quit',event=>{if(quitting)return;event.preventDefault();quitting=true;clearInterval(scheduler);engine?.cancel();activeChild?.kill();maintenanceRemote?.cancel();providers?.cancel();for(const watcher of watchers.values())watcher.close();Promise.all([tasks.global,...tasks.accounts.values()]).then(async()=>{await providers?.close();await journalMaintenance?.close();await persistQueue;}).finally(()=>{desktop?.stop();store?.close();app.quit();});});
 app.on('window-all-closed',()=>{});
 app.on('activate',()=>{if(BrowserWindow.getAllWindows().length===0&&vault)createWindow();else showWindow();});
