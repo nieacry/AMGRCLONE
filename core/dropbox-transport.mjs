@@ -64,7 +64,7 @@ export class DropboxTransport {
   async headers(signal=this.abort.signal){signal.throwIfAborted();const token=await this.auth(),profile=await this.accountProfile(token,signal);signal.throwIfAborted();const namespace=this.scope==='team'?profile.root_info.root_namespace_id:profile.root_info.home_namespace_id;return {Authorization:'Bearer '+token,'Dropbox-API-Path-Root':JSON.stringify({'.tag':'namespace_id',namespace_id:namespace})};}
   async request(endpoint,body,{signal}={}){const outer=AbortSignal.any([this.abort.signal,...(signal?[signal]:[])]);const response=await this.retrying(outer,async()=>{const requestSignal=AbortSignal.any([outer,AbortSignal.timeout(30000)]);return this.send('https://api.dropboxapi.com/2/'+endpoint,{method:'POST',headers:{...await this.headers(requestSignal),'Content-Type':'application/json'},body:JSON.stringify(body)},requestSignal);});return response.json();}
   async metadata(relative,options){return entry(await this.request('files/get_metadata',{path:remotePath(relative)},options));}
-  async *listPages(relative,recursive=true,{signal,onProgress}={}){
+  async *listPages(relative,recursive=true,{signal,onProgress,onCursor}={}){
     const listingSignal=AbortSignal.any([this.abort.signal,...(signal?[signal]:[])]);let count=0;
     let response=await this.request('files/list_folder',{path:remotePath(relative),recursive,include_deleted:false,include_mounted_folders:true},{signal:listingSignal});
     while(true){
@@ -77,7 +77,7 @@ export class DropboxTransport {
       count+=page.length;onProgress?.(count);yield page;
       // Release each API response before fetching the next page, and let UI/cancel IPC run.
       const more=response.has_more,cursor=response.cursor;response=null;
-      await yieldToEventLoop();listingSignal.throwIfAborted();if(!more)break;
+      await yieldToEventLoop();listingSignal.throwIfAborted();if(!more){onCursor?.(cursor);break;}
       response=await this.request('files/list_folder/continue',{cursor},{signal:listingSignal});
     }
   }
@@ -106,6 +106,14 @@ export class DropboxTransport {
       throw error;
     }
   }
+  // Roadmap 4.2: waits up to `timeout` seconds (30-480) for any change after `cursor`. The notify
+  // endpoint takes no Authorization header: the cursor identifies the account and folder.
+  async longpoll(cursor,{timeout=120,signal}={}){
+    const requestSignal=AbortSignal.any([this.abort.signal,...(signal?[signal]:[]),AbortSignal.timeout((timeout+90)*1000)]);
+    const response=await fetch('https://notify.dropboxapi.com/2/files/list_folder/longpoll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cursor,timeout}),signal:requestSignal});
+    if(!response.ok){const error=await responseError(response);error.reset=/(^|\/)reset(\/|$)/.test(error.dropboxSummary);throw error;}
+    const result=await response.json();return {changes:!!result.changes,backoff:Number.isFinite(result.backoff)?result.backoff:0};
+  }
   // Disables the token and its refresh token at Dropbox (roadmap 2.6). Best effort.
   async revoke(){const signal=AbortSignal.any([this.abort.signal,AbortSignal.timeout(15000)]);const response=await fetch('https://api.dropboxapi.com/2/auth/token/revoke',{method:'POST',headers:{Authorization:'Bearer '+await this.auth()},signal});if(!response.ok&&response.status!==401)throw await responseError(response);}
   // Brings back a deleted file at its old path, at the revision this computer last knew.
@@ -123,8 +131,13 @@ export class LocalTransport {
   async list(relative,_recursive=true,{signal,onProgress}={}){const items=[];const scan=async current=>{signal?.throwIfAborted();for(const dirent of await readdir(this.local(current),{withFileTypes:true})){signal?.throwIfAborted();if(dirent.isSymbolicLink())throw new Error('err.link');const child=current?current+'/'+dirent.name:dirent.name;items.push({path:child,...await this.metadata(child)});onProgress?.(items.length);if(dirent.isDirectory())await scan(child);}};await scan(relative);signal?.throwIfAborted();return items;}
   async find(item){const all=await this.list('');const found=all.find(i=>i.remoteId===item.remoteId);if(!found)throw Object.assign(new Error('err.nativeConflict'),{notFound:true});return found;}
   async download(item,{offset,length,signal}){const current=await this.metadata(item.path);if(current.rev!==item.rev)throw new Error('err.nativeConflict');return createReadStream(this.local(item.path),{start:offset,end:offset+length-1,signal});}
-  async upload(relative,filename,previous){const current=await this.metadata(relative).catch(error=>{if(error.code==='ENOENT')return null;throw error;});if((previous&&current?.rev!==previous.rev)||(!previous&&current))throw new Error('err.nativeConflict');await mkdir(path.dirname(this.local(relative)),{recursive:true});await writeFile(this.local(relative),await readFile(filename));return this.metadata(relative);}
+  async upload(relative,filename,previous){const current=await this.metadata(relative).catch(error=>{if(error.code==='ENOENT')return null;throw error;});if((previous&&current?.rev!==previous.rev)||(!previous&&current))throw Object.assign(new Error('err.nativeConflict'),{versionConflict:true,dropboxSummary:'path/conflict/file/..'});await mkdir(path.dirname(this.local(relative)),{recursive:true});await writeFile(this.local(relative),await readFile(filename));return this.metadata(relative);}
   async createFolder(relative){await mkdir(this.local(relative));return this.metadata(relative);}
-  async remove(item){const current=await this.find(item);if(item.rev&&current.rev!==item.rev)throw new Error('err.nativeConflict');if(current.kind==='folder')await rm(this.local(current.path),{recursive:true});else await unlink(this.local(current.path));}
+  // Deleted files go to a trash next to the fake cloud, keyed by revision, like Dropbox's history.
+  trash(rev){return path.join(path.dirname(this.root),path.basename(this.root)+'-trash',rev);}
+  async remove(item){const current=await this.find(item);if(item.rev&&current.rev!==item.rev)throw new Error('err.nativeConflict');
+    const keep=async entry=>{if(entry.kind!=='file')return;await mkdir(path.dirname(this.trash(entry.rev)),{recursive:true});await writeFile(this.trash(entry.rev),await readFile(this.local(entry.path)));};
+    if(current.kind==='folder'){for(const entry of await this.list(current.path))await keep(entry);await rm(this.local(current.path),{recursive:true});}else{await keep(current);await unlink(this.local(current.path));}}
+  async restore(item){const bytes=await readFile(this.trash(item.rev)).catch(()=>{throw Object.assign(new Error('err.nativeConflict'),{notFound:true});});await mkdir(path.dirname(this.local(item.path)),{recursive:true});await writeFile(this.local(item.path),bytes);return this.metadata(item.path);}
   async move(item,target){const current=await this.find(item);if(item.rev&&current.rev!==item.rev)throw new Error('err.nativeConflict');await rename(this.local(current.path),this.local(target));return this.metadata(target);}
 }

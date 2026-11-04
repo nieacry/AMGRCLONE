@@ -2,7 +2,7 @@ import {mkdir,readdir,lstat,readFile,writeFile,unlink,utimes,realpath} from 'nod
 import {watch} from 'node:fs';
 import {createHash,randomUUID} from 'node:crypto';
 import path from 'node:path';
-import {itemIdentity as identity,deleting,recoverPlaceholder,prepareDeletion,finishDeletions} from './native-deletions.mjs';
+import {itemIdentity as identity,deleting,recoverPlaceholder,prepareDeletion,finishDeletions,commonFolder} from './native-deletions.mjs';
 import {missingRoot} from './account-recovery.mjs';
 import {NativeHost,retryableNativeError} from './native-host.mjs';
 import {contains,effectivePolicy,validateLocalMapping,validateRemotePath,mappingError} from './policy.mjs';
@@ -11,15 +11,20 @@ import {nativeAvailabilityStates,nativeFileStatus} from './native-availability.m
 import {skippableMapping,mappingBlocks,blockedPath,containsSkipped} from './native-skips.mjs';
 import {setImmediate as yieldToEventLoop} from 'node:timers/promises';
 import {resolvable,resolveConflict} from './conflicts.mjs';
-import {exceedsThreshold,fullyLocal,quarantineFile,pruneQuarantine,reviewSummary,quarantineRoot} from './deletion-guard.mjs';
+import {ensureSpace,exceedsThreshold,fullyLocal,quarantineFile,pruneQuarantine,reviewSummary,quarantineRoot} from './deletion-guard.mjs';
 
-export const HYDRATION_LANES=2;
+// Held Explorer deletions shown as one decision per batch.
+function groupConfirmations(ops){
+  const groups=new Map();for(const op of ops){const key=op.batch||op.id;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(op);}
+  return [...groups].map(([id,list])=>({id,path:commonFolder(list.map(op=>op.path)),action:list.every(op=>op.action==='recycle')?'recycle':'delete',count:list.reduce((sum,op)=>sum+(op.remoteBaseline||op.items).length,0),preparedAt:Math.min(...list.map(op=>op.preparedAt))}));
+}
+export const HYDRATION_LANES=2,INSPECT_BATCH=512;
 const order=(a,b)=>a.path.split('/').length-b.path.split('/').length||a.path.localeCompare(b.path);
 export function selectedRoots(rules){return Object.keys(rules).filter(p=>rules[p].selected).sort((a,b)=>a.length-b.length).filter((p,_i,all)=>!all.some(parent=>parent!==p&&contains(parent,p)));}
 function supported(relative){validateLocalMapping(relative,'win32');return !relative.split('/').some(p=>p.toLowerCase()==='.amg-backups'||p.startsWith('.amg-access-'));}
 export class NativeProviders {
   constructor({binary,dataDir,store,transport,persist,onReview}){this.binary=binary;this.dataDir=dataDir;this.store=store;this.transport=transport;this.persist=persist;this.onReview=onReview;this.contexts=new Map();this.closed=false;this.paused=false;}
-  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,awaiting=[...(ctx.deletions?.values()||[])].filter(op=>op.awaitingConfirmation&&!op.confirmed),pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0)-awaiting.length;return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size||ctx.hydrations?.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts,conflictCopies:ctx.conflictCopies||0},review:ctx.review&&!ctx.review.approved?{id:ctx.review.id,created:ctx.review.created,...reviewSummary(ctx.review.items)}:null,confirmations:awaiting.map(op=>({id:op.id,path:op.path,action:op.action,count:(op.remoteBaseline||op.items).length,preparedAt:op.preparedAt}))};}
+  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,awaiting=[...(ctx.deletions?.values()||[])].filter(op=>op.awaitingConfirmation&&!op.confirmed),pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0)-awaiting.length;return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size||ctx.hydrations?.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts,conflictCopies:ctx.conflictCopies||0},metrics:{...ctx.metrics,cloudWatch:!!ctx.cloudWatch?.healthy},review:ctx.review&&!ctx.review.approved?{id:ctx.review.id,created:ctx.review.created,...reviewSummary(ctx.review.items)}:null,confirmations:groupConfirmations(awaiting)};}
   save(ctx,item){ctx.items.set(item.key,item);this.store.saveNativeItem(ctx.acc.id,item);return item;}
   async itemStates(acc,paths){
     const ctx=this.contexts.get(acc.id);if(!ctx||ctx.closed||ctx.failed||!ctx.host||acc.native?.resetting)return nativeAvailabilityStates([],paths);
@@ -38,9 +43,10 @@ export class NativeProviders {
       ctx.host.on('stopped',()=>{if(!ctx.closed)this.recordError(ctx,new Error('err.nativeStopped'));});
       ctx.registration=await ctx.host.request('init',{root:acc.native.root,cache,owner:acc.native.owner,displayName:acc.name});ctx.shell=await ctx.host.request('checkPath',{path:acc.native.root});if(ctx.closed)throw new Error('err.nativeStopped');
       if(!(acc.native.resetting&&acc.native.resetMode==='keepDownloaded'))await finishDeletions(this,ctx,{recover:true}).catch(error=>this.recordError(ctx,error));
-      ctx.watcher=watch(acc.native.root,{recursive:true},()=>{ctx.changed=true;});ctx.watcher.on('error',error=>this.recordError(ctx,error));
+      ctx.watcher=watch(acc.native.root,{recursive:true},(_type,filename)=>this.noteChange(ctx,filename?String(filename).split(path.sep).join('/'):null));ctx.watcher.on('error',error=>this.recordError(ctx,error));
       ctx.timer=setInterval(()=>this.background(ctx).catch(()=>{}),5000);
       if(this.dataDir)pruneQuarantine({dataDir:this.dataDir,accountId:acc.id}).catch(()=>{});
+      this.watchCloud(ctx);
       ctx.busy=false;return ctx;
     }catch(error){ctx.busy=false;ctx.failed=true;this.recordError(ctx,error);throw error;}})();
     return ctx.ready;
@@ -52,7 +58,12 @@ export class NativeProviders {
     // Roadmap 3.5: 60-75 s between cloud checks, chosen per cycle, so five computers on one Dropbox
     // account do not list it in lockstep.
     ctx.checkEvery??=60000+Math.round(Math.random()*15000);
-    const due=ctx.needsReconcile||!ctx.lastChecked||Date.now()-ctx.lastChecked>=ctx.checkEvery;
+    // While the cloud watch (longpoll) is healthy, a change triggers the check within seconds and the
+    // full listing is only a 10-15 minute safety net (roadmap 4.2).
+    ctx.safetyEvery??=600000+Math.round(Math.random()*300000);
+    const interval=ctx.cloudWatch?.healthy?ctx.safetyEvery:ctx.checkEvery;
+    const due=ctx.needsReconcile||ctx.cloudChanged||!ctx.lastChecked||Date.now()-ctx.lastChecked>=interval;
+    if(due)ctx.safetyEvery=undefined;
     if(!ctx.changed&&!due&&![...ctx.deletions.values()].some(op=>!op.awaitingConfirmation||op.confirmed))return;
     await this.serial(ctx,async()=>{ctx.changed=false;await finishDeletions(this,ctx);await this.scan(ctx);if(due){await this.reconcile(ctx);await this.resolveConflicts(ctx);}});
   }
@@ -75,7 +86,7 @@ export class NativeProviders {
     try{return await refresh;}catch(error){if(retryableNativeError(error))return this.status(acc);throw error;}finally{if(ctx.refreshing===refresh)ctx.refreshing=null;}
   }
   async collect(ctx,rules=ctx.acc.settings.rules){
-    const roots=selectedRoots(rules),all=new Map(),skips=new Map(),signal=ctx.operation?.signal;ctx.progress={phase:'listing',completed:0};
+    const roots=selectedRoots(rules),all=new Map(),skips=new Map(),cursors=new Map(),signal=ctx.operation?.signal;ctx.progress={phase:'listing',completed:0};
     const include=item=>{if(!effectivePolicy(item.path,rules).selected)return false;try{return supported(item.path);}catch(error){if(!skippableMapping(error))throw error;skips.set(item.path,{item,reason:error.nativeStage});return false;}};
     for(const relative of roots){
       signal?.throwIfAborted();validateRemotePath(relative);
@@ -83,7 +94,7 @@ export class NativeProviders {
       const prior=all.size,options={signal,onProgress:count=>{ctx.progress={phase:'listing',completed:prior+count};}};
       if(top.kind!=='folder')continue;
       // Consume one page at a time, rather than retaining a second full-tree array.
-      const pages=ctx.remote.listPages?ctx.remote.listPages(relative,true,options):(async function*(){yield await ctx.remote.list(relative,true,options);})();
+      const pages=ctx.remote.listPages?ctx.remote.listPages(relative,true,{...options,onCursor:cursor=>cursors.set(relative,cursor)}):(async function*(){yield await ctx.remote.list(relative,true,options);})();
       for await(const page of pages){let processed=0;for(const item of page){signal?.throwIfAborted();if(include(item))all.set(item.path,item);if(++processed%1024===0)await yieldToEventLoop();}await yieldToEventLoop();signal?.throwIfAborted();}
     }
     // Resolve each ancestor chain once, even when a folder contains hundreds of thousands of files.
@@ -99,34 +110,41 @@ export class NativeProviders {
     // check. Failed pages must not authorize removals or clear prior protection.
     for(const [relative,entry]of skips){signal?.throwIfAborted();if(ctx.mappingSkips?.get(relative)?.reason!==entry.reason)this.log(ctx,entry.item,'skipped','none','skipped',entry.reason);if(++processed%1024===0)await yieldToEventLoop();}
     ctx.mappingSkips=skips;ctx.mappingBlocks=mappingBlocks(skips,ctx.items.values());
+    // A complete listing: its cursors are where the cloud watch continues from (roadmap 4.2).
+    if(cursors.size===roots.length){ctx.cursors=cursors;ctx.cursorGeneration=(ctx.cursorGeneration||0)+1;}else ctx.cursors=null;
     return [...all.values()].sort(order);
   }
   async reconcile(ctx){
+    const startedAt=Date.now();ctx.cloudChanged=false;
     const rules=structuredClone(ctx.acc.settings.rules),listing=await this.collect(ctx,rules),seen=new Set(),byRemoteId=new Map([...ctx.items.values()].map(item=>[item.remoteId,item]));ctx.operation?.signal.throwIfAborted();ctx.progress={phase:'placeholders',completed:0,total:listing.length};
     ctx.remoteCatalog=listing;
     // Items whose Dropbox ID disappeared, by path: a file deleted and created again under the same
     // name gets a new ID and must replace the old placeholder, not look like a conflict plus a deletion.
     const listedIds=new Set(listing.map(remote=>remote.remoteId)),canonical=value=>value.normalize('NFC').toLowerCase();
     const vanished=new Map([...ctx.items.values()].filter(item=>item.remoteId&&!listedIds.has(item.remoteId)&&!['orphaned','conflict'].includes(item.status)).map(item=>[canonical(item.path),item]));
+    // Roadmap 4.6: local state for the whole listing in a few batched requests instead of one per file.
+    const prefetched=await this.inspectMany(ctx,listing.filter(remote=>!blockedPath(ctx,remote.path)&&!deleting(ctx,remote.path)).map(remote=>remote.path));
+    const inspect=relative=>ctx.host.request('inspect',{path:relative});
     for(const remote of listing){
       ctx.operation?.signal.throwIfAborted();ctx.progress.completed++;
       if(blockedPath(ctx,remote.path))continue;
       if(deleting(ctx,remote.path))continue;
       let existing=byRemoteId.get(remote.remoteId);
       if(!existing){const replaced=vanished.get(canonical(remote.path));
-        if(replaced&&replaced.kind===remote.kind&&replaced.path===remote.path&&!seen.has(replaced.key)){const before=await ctx.host.request('inspect',{path:remote.path});
+        if(replaced&&replaced.kind===remote.kind&&replaced.path===remote.path&&!seen.has(replaced.key)){const before=prefetched.get(remote.path)??await inspect(remote.path);
           if(before.exists&&before.placeholder&&before.identity===replaced.identity&&before.inSync&&!before.dirtyBytes){
             if(fullyLocal(before))await this.quarantine(ctx,replaced);
             existing=replaced;vanished.delete(canonical(remote.path));}}}
       let item=existing?{...existing}: {...remote,key:randomUUID(),status:'creating'};
       seen.add(item.key);const priorIdentity=existing?.identity;
+      let touched=false;
       if(existing&&existing.path!==remote.path){
-        const atNew=await ctx.host.request('inspect',{path:remote.path});
+        const atNew=prefetched.get(remote.path)??await inspect(remote.path);touched=true;
         if(!atNew.exists)await ctx.host.request('moveLocal',{path:existing.path,target:remote.path,identity:existing.identity});
         else if(atNew.identity!==existing.identity){this.save(ctx,{...existing,status:'conflict'});continue;}
         item.path=remote.path;
       }
-      const state=await ctx.host.request('inspect',{path:remote.path});
+      const state=touched?await inspect(remote.path):prefetched.get(remote.path)??await inspect(remote.path);
       if(state.exists&&existing&&(!state.placeholder||!state.inSync)&&existing.status!=='creating'){
         if(remote.rev!==existing.rev)this.save(ctx,{...existing,status:'conflict'});
         // Before 0.16.6 a temporary Dropbox failure (any HTTP 409) left local edits in `conflict`
@@ -136,27 +154,28 @@ export class NativeProviders {
       }
       item={...item,...remote};item.identity=identity(item);
       if(!existing)this.save(ctx,item); // Persist creation intent before creating an OS placeholder.
-      if(!state.exists){await ctx.host.request('create',{path:item.path,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'placeholder','download');}
+      if(!state.exists){touched=true;await ctx.host.request('create',{path:item.path,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'placeholder','download');}
       else if(!state.placeholder){this.save(ctx,{...item,status:'conflict'});continue;}
       else if(state.identity!==(priorIdentity||item.identity)){this.save(ctx,{...item,status:'conflict'});continue;}
-      else if(existing&&item.identity!==priorIdentity){await ctx.host.request('update',{path:item.path,previousIdentity:priorIdentity,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'updated','download');}
+      else if(existing&&item.identity!==priorIdentity){touched=true;await ctx.host.request('update',{path:item.path,previousIdentity:priorIdentity,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'updated','download');}
       item=this.save(ctx,item);
       if(item.kind==='file'){
         const desired=effectivePolicy(item.path,rules).mode;
-        const current=await ctx.host.request('inspect',{path:item.path});
+        const current=touched?await inspect(item.path):state;let dehydrated=false;
         // Downloading a pinned file can take hours: it runs in its own lane, not in this one.
         if(desired==='local'&&(current.partial||current.pin!==1))this.hydrate(ctx,item);
-        else if(desired==='online'&&current.pin===1)await ctx.host.request('availability',{path:item.path,identity:item.identity,mode:'online'});
-        const actual=await ctx.host.request('inspect',{path:item.path});this.save(ctx,{...item,status:nativeFileStatus(actual)});
+        else if(desired==='online'&&current.pin===1){dehydrated=true;await ctx.host.request('availability',{path:item.path,identity:item.identity,mode:'online'});}
+        const actual=dehydrated?await inspect(item.path):current;this.save(ctx,{...item,status:nativeFileStatus(actual)});
       }else this.save(ctx,{...item,status:'cached'});
     }
     // A changed selection invalidates this snapshot for removals; the queued refresh will use the new rules.
     if(JSON.stringify(rules)!==JSON.stringify(ctx.acc.settings.rules)){ctx.needsReconcile=true;ctx.refreshAgain=true;return;}
     // Removals: decide on the whole set first, then act. Edited local data is never removed (conflict).
-    const removals=[];
-    for(const item of [...ctx.items.values()].filter(i=>!seen.has(i.key)&&i.status!=='orphaned'&&!deleting(ctx,i.path)&&!containsSkipped(ctx,i.path)).sort((a,b)=>order(b,a))){
+    const removals=[],unseen=[...ctx.items.values()].filter(i=>!seen.has(i.key)&&i.status!=='orphaned'&&!deleting(ctx,i.path)&&!containsSkipped(ctx,i.path)).sort((a,b)=>order(b,a));
+    const unseenStates=await this.inspectMany(ctx,unseen.map(item=>item.path));
+    for(const item of unseen){
       ctx.operation?.signal.throwIfAborted();
-      const state=await ctx.host.request('inspect',{path:item.path});
+      const state=unseenStates.get(item.path)??await inspect(item.path);
       if(state.exists&&(!state.placeholder||state.identity!==item.identity||!state.inSync||state.dirtyBytes)){this.save(ctx,{...item,status:'conflict'});continue;}
       removals.push({item,state,deselected:!effectivePolicy(item.path,rules).selected,downloaded:item.kind==='file'&&fullyLocal(state)});
     }
@@ -178,15 +197,33 @@ export class NativeProviders {
     }
     if(!held.size&&ctx.review)await this.setReview(ctx,null);
     for(const item of ctx.items.values()){ctx.operation?.signal.throwIfAborted();if(item.kind==='folder'&&item.status!=='conflict'&&item.status!=='orphaned'&&!deleting(ctx,item.path)&&!blockedPath(ctx,item.path))await ctx.host.request('folderAvailability',{path:item.path,identity:item.identity,mode:effectivePolicy(item.path,rules).mode});}
-    ctx.lastChecked=Date.now();ctx.checkEvery=undefined;ctx.checkedThisRun=true;ctx.needsReconcile=!!ctx.retry;
+    ctx.lastChecked=Date.now();ctx.checkEvery=undefined;ctx.checkedThisRun=true;
+    ctx.metrics={...ctx.metrics,lastReconcileMs:ctx.lastChecked-startedAt,lastReconcileItems:listing.length,cloudListings:(ctx.metrics?.cloudListings||0)+1};ctx.needsReconcile=!!ctx.retry;
   }
   async finishCheck(ctx){if(ctx.checkedThisRun&&!ctx.acc.native.resetting&&!ctx.review&&!ctx.deletions?.size&&!ctx.error&&!ctx.retry&&!ctx.fetches.size&&!ctx.hydrations?.size&&!ctx.uploads.size&&![...ctx.items.values()].some(i=>!blockedPath(ctx,i.path)&&['dirty','conflict','creating','pendingRename','orphaned'].includes(i.status))){ctx.acc.native.lastSync=ctx.lastChecked;await this.persist();}}
-  async scan(ctx){
-    const paths=[],byPath=new Map([...ctx.items.values()].map(item=>[item.path,item]));const walk=async relative=>{ctx.operation?.signal.throwIfAborted();for(const info of await readdir(path.join(ctx.acc.native.root,...relative.split('/')),{withFileTypes:true})){ctx.operation?.signal.throwIfAborted();const child=relative?relative+'/'+info.name:info.name;if(info.isSymbolicLink())throw new Error('err.link');paths.push(child);if(info.isDirectory())await walk(child);}};await walk('');
+  // Roadmap 4.4: only paths reported changed (Explorer/file-system events and the helper's close
+  // notifications) are examined. Everything is walked at start-up, after an event overflow and every
+  // 10-15 minutes as a safety net. Paths of a failed pass are kept for the next one.
+  async scan(ctx,{full=false}={}){
+    const byPath=new Map([...ctx.items.values()].map(item=>[item.path,item])),root=ctx.acc.native.root,listed=new Set(),paths=[];
+    const add=relative=>{if(relative&&!listed.has(relative)){listed.add(relative);paths.push(relative);}};
+    const walk=async relative=>{ctx.operation?.signal.throwIfAborted();for(const info of await readdir(path.join(root,...relative.split('/')),{withFileTypes:true})){ctx.operation?.signal.throwIfAborted();const child=relative?relative+'/'+info.name:info.name;if(info.isSymbolicLink())throw new Error('err.link');add(child);if(info.isDirectory())await walk(child);}};
+    const everything=full||!(ctx.changedPaths instanceof Set)||!ctx.lastFullScan||Date.now()-ctx.lastFullScan>=(ctx.fullScanEvery??=600000+Math.round(Math.random()*300000));
+    const requeue=everything?null:ctx.changedPaths;ctx.changedPaths=new Set();
+    if(everything){await walk('');ctx.lastFullScan=Date.now();ctx.fullScanEvery=undefined;}
+    else for(const changed of requeue){
+      const parts=changed.split('/').filter(Boolean);if(!parts.length||parts.some(p=>p==='.'||p==='..'))continue;
+      for(let depth=1;depth<parts.length;depth++)add(parts.slice(0,depth).join('/'));
+      const relative=parts.join('/'),info=await lstat(path.join(root,...parts)).catch(error=>{if(error.code==='ENOENT'||error.code==='ENOTDIR')return null;throw error;});
+      if(!info)continue;if(info.isSymbolicLink())throw new Error('err.link');add(relative);if(info.isDirectory())await walk(relative);
+    }
+    ctx.metrics={...ctx.metrics,lastScanPaths:paths.length,lastScanFull:everything};
+    try{
+    const prefetched=await this.inspectMany(ctx,paths.filter(relative=>!deleting(ctx,relative)&&!blockedPath(ctx,relative)));
     for(const relative of paths.sort((a,b)=>a.split('/').length-b.split('/').length)){
       ctx.operation?.signal.throwIfAborted();
       if(deleting(ctx,relative)||blockedPath(ctx,relative)||!supported(relative)||!effectivePolicy(relative,ctx.acc.settings.rules).selected)continue;
-      let known=byPath.get(relative);let actual=await ctx.host.request('inspect',{path:relative});if(!actual.exists)continue;
+      let known=byPath.get(relative);let actual=prefetched.get(relative)??await ctx.host.request('inspect',{path:relative});if(!actual.exists)continue;
       if(known?.status==='conflict'||known?.status==='orphaned')continue;
       if(known?.status==='pendingRename'){await this.finishRename(ctx,known);continue;}
       if(actual.placeholder){if(!known){known=await recoverPlaceholder(this,ctx,relative,actual);if(known.status==='orphaned')continue;}if(actual.identity!==known.identity){ctx.error='err.nativeConflict';continue;}if(actual.inSync){const status=actual.directory?'cached':nativeFileStatus(actual);if(known.status!==status)this.save(ctx,{...known,status});continue;}}
@@ -194,10 +231,11 @@ export class NativeProviders {
       if(actual.directory){if(!known){const remote=await ctx.remote.createFolder(relative);known={key:randomUUID(),path:relative,...remote,status:'creating'};known.identity=identity(known);this.save(ctx,known);const committed=await ctx.host.request('commit',{path:relative,identity:known.identity,stamp:actual.stamp,directory:true});if(committed.committed){this.save(ctx,{...known,status:'cached'});ctx.needsReconcile=true;this.log(ctx,known,'upload','upload');}}continue;}
       if(actual.placeholder&&(actual.partial||actual.onDisk<actual.size)){await ctx.host.request('availability',{path:relative,identity:known.identity,mode:'local'},86400000);actual=await ctx.host.request('inspect',{path:relative});if(actual.partial||actual.onDisk<actual.size)throw new Error('err.nativeConflict');}
       if(known)this.save(ctx,{...known,status:'dirty'});
+      await ensureSpace(ctx.cache,actual.size);
       const file=path.join(ctx.cache,'snapshot-'+randomUUID());
       await ctx.host.request('transfer',{path:relative,identity:known?.identity||'',busy:true}).catch(()=>{});
       try{
-        let snapshot;try{snapshot=await ctx.host.request('snapshot',{path:relative,file});}catch(error){if(retryableNativeError(error)){this.recordError(ctx,error);continue;}throw error;}
+        let snapshot;try{snapshot=await ctx.host.request('snapshot',{path:relative,file});}catch(error){if(retryableNativeError(error)){this.recordError(ctx,error);ctx.changedPaths.add(relative);continue;}throw error;}
         await utimes(file,new Date(snapshot.modified),new Date(snapshot.modified));const checksum=await dropboxHash(file),uploadAbort=new AbortController();uploadAbort.nativePath=relative;ctx.uploads.add(uploadAbort);let remote;try{remote=await ctx.remote.upload(relative,file,known,{signal:uploadAbort.signal});}catch(error){if(uploadAbort.signal.aborted)throw new Error('err.canceled');throw error;}finally{ctx.uploads.delete(uploadAbort);}
         if(remote.hash!==checksum)throw new Error('err.nativeConflict');
         const item={...known,key:known?.key||randomUUID(),path:relative,...remote,status:'dirty'};const nextIdentity=identity(item);item.identity=known?.identity||nextIdentity;this.save(ctx,item);
@@ -214,15 +252,16 @@ export class NativeProviders {
         throw error;}
       finally{await ctx.host.request('transfer',{path:relative,busy:false}).catch(()=>{});await unlink(file).catch(()=>{});}
     }
+    }catch(error){if(requeue)for(const relative of requeue)ctx.changedPaths.add(relative);else ctx.changedPaths=null;throw error;}
   }
   async event(ctx,event){
     if(event.event==='cancel'){ctx.fetches.get(event.request)?.abort();return;}
-    if(event.event==='changed'){ctx.changed=true;return;}
+    if(event.event==='changed'){this.noteChange(ctx,event.path);return;}
     if(event.event==='completed'){if(ctx.acc.native?.resetting)return;await this.serial(ctx,()=>finishDeletions(this,ctx));return;}
     if(event.event==='nativeError'){const error=new Error('err.nativeMoveOut');error.nativeCommand=event.operation;this.recordError(ctx,error);return;}
     if(event.event==='fetch'){
       if(ctx.noDownloadReset||(ctx.acc.native?.resetting&&ctx.acc.native.resetMode==='keepDownloaded')){await ctx.host.request('fail',{request:event.request}).catch(()=>{});return;}
-      const source=[...ctx.items.values()].find(i=>i.identity===event.identity);if(!source){await ctx.host.request('fail',{request:event.request}).catch(()=>{});return;}
+      const source=this.byIdentity(ctx,event.identity);if(!source){await ctx.host.request('fail',{request:event.request}).catch(()=>{});return;}
       const item={...source},controller=new AbortController();controller.nativePath=item.path;ctx.fetches.set(event.request,controller);
       try{
         const offset=Math.floor(event.offset/4096)*4096,end=Math.min(item.size,event.length<0?item.size:Math.ceil((event.offset+event.length)/4096)*4096),length=end-offset;
@@ -261,6 +300,54 @@ export class NativeProviders {
       try{const result=await resolveConflict(this,ctx,item,{remote,state});if(result.resolved)ctx.conflictCopies=(ctx.conflictCopies||0)+1;}
       catch(error){error.nativePath||=item.path;error.nativeCommand||='upload';throw error;}
     }
+  }
+  // Roadmap 4.2: long-polls Dropbox with the cursors of the last complete listing. A change sets
+  // ctx.cloudChanged, which makes the next background cycle (within 5 s) check the cloud.
+  async watchCloud(ctx,{retryMs=30000,idleMs=5000}={}){
+    if(!ctx.remote?.longpoll||ctx.cloudWatch)return;
+    const watch=ctx.cloudWatch={healthy:false,generation:0};
+    const pause=ms=>new Promise(resolve=>{const timer=setTimeout(resolve,ms);watch.wake=()=>{clearTimeout(timer);resolve();};});
+    while(!ctx.closed&&!this.closed){
+      const cursors=ctx.cursors;
+      if(!cursors?.size||ctx.cloudChanged||ctx.suspended||this.paused){await pause(idleMs);continue;}
+      const generation=ctx.cursorGeneration,controller=new AbortController();watch.controller=controller;
+      try{
+        const result=await Promise.race([...cursors.values()].map(cursor=>ctx.remote.longpoll(cursor,{timeout:120,signal:controller.signal})));
+        watch.healthy=true;
+        if(result.changes&&generation===ctx.cursorGeneration)ctx.cloudChanged=true;
+        if(result.backoff)await pause(result.backoff*1000);
+      }catch(error){
+        if(ctx.closed||this.closed)break;
+        watch.healthy=false;if(error.reset){ctx.cursors=null;ctx.cloudChanged=true;}
+        await pause(retryMs);
+      }finally{controller.abort();}
+    }
+    watch.healthy=false;
+  }
+  // Roadmap 4.7: identity -> item in O(1) for download callbacks. The index is rebuilt only when a
+  // lookup finds a stale or missing entry, so code that edits ctx.items directly stays correct.
+  byIdentity(ctx,identity){
+    const check=key=>{const item=key&&ctx.items.get(key);return item?.identity===identity?item:null;};
+    let found=check(ctx.identityIndex?.get(identity));if(found)return found;
+    ctx.identityIndex=new Map([...ctx.items.values()].map(item=>[item.identity,item.key]));
+    return check(ctx.identityIndex.get(identity));
+  }
+  // A changed local path. Unknown (null) or too many at once means: walk everything next time.
+  noteChange(ctx,relative){ctx.changed=true;if(typeof relative!=='string'||!relative||!(ctx.changedPaths instanceof Set)||ctx.changedPaths.size>=5000){ctx.changedPaths=null;return;}ctx.changedPaths.add(relative.replaceAll('\\','/'));}
+  // Batched local inspection (roadmap 4.6). Returns a Map of the states it could read; a path that
+  // failed, or every path when the helper predates `inspectMany`, is left out and the caller asks
+  // for it alone. Old helpers answer an unknown command with E_INVALIDARG.
+  async inspectMany(ctx,paths){
+    const states=new Map();if(!paths.length||ctx.batchInspect===false)return states;
+    try{
+      for(let start=0;start<paths.length;start+=INSPECT_BATCH){
+        ctx.operation?.signal.throwIfAborted();const chunk=paths.slice(start,start+INSPECT_BATCH);
+        const answer=await ctx.host.request('inspectMany',{paths:chunk},120000);
+        chunk.forEach((relative,n)=>{const state=answer?.states?.[n];if(state&&!state.error)states.set(relative,state);});
+        if(start+INSPECT_BATCH<paths.length)await yieldToEventLoop();
+      }
+    }catch(error){if(error.nativeCode?.toLowerCase()!=='0x80070057'||error.nativeCommand!=='inspectMany')throw error;ctx.batchInspect=false;states.clear();}
+    return states;
   }
   // Roadmap 3.2: pinning ("always keep on this device") downloads in a separate lane with at most
   // HYDRATION_LANES files at a time. The serialized lane (scans, uploads, Explorer deletions and
@@ -313,12 +400,16 @@ export class NativeProviders {
       return this.refresh(acc);
     }
     if(action==='confirm'||action==='cancel'){
-      const op=ctx.deletions.get(operationId);if(!op)return this.status(acc);
+      // `operationId` names a batch (or a single operation from before batching).
+      const ops=[...ctx.deletions.values()].filter(op=>op.batch===operationId||op.id===operationId);if(!ops.length)return this.status(acc);
       await this.serial(ctx,async()=>{
-        if(action==='confirm'){const next={...op,confirmed:true};ctx.deletions.set(op.id,next);this.store.saveNativeDeletion(ctx.acc.id,next);await finishDeletions(this,ctx);return;}
-        const current=op.items.find(i=>i.path===op.path)||{kind:'folder',size:0};
-        this.store.cancelNativeDeletion(ctx.acc.id,op,{path:op.path,kind:current.kind,size:current.size,action:op.action,direction:'none',status:'failed',detail:'err.nativeDeleteCanceled'});
-        ctx.deletions.delete(op.id);ctx.needsReconcile=true;
+        if(action==='confirm'){for(const op of ops){const next={...op,confirmed:true};ctx.deletions.set(op.id,next);this.store.saveNativeDeletion(ctx.acc.id,next);}await finishDeletions(this,ctx);return;}
+        for(const op of ops){
+          const current=op.items.find(i=>i.path===op.path)||{kind:'folder',size:0};
+          this.store.cancelNativeDeletion(ctx.acc.id,op,{path:op.path,kind:current.kind,size:current.size,action:op.action,direction:'none',status:'failed',detail:'err.nativeDeleteCanceled'});
+          ctx.deletions.delete(op.id);
+        }
+        ctx.needsReconcile=true;
       },{user:true});
       return this.refresh(acc);
     }

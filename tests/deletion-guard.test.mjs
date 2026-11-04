@@ -206,3 +206,43 @@ test('a small Explorer deletion still goes straight to Dropbox',async()=>{
   await finishDeletions(f.providers,f.ctx);
   assert.deepEqual(f.remote.removed,['Shots']);assert.equal(f.reviews.length,0);assert.equal(f.ctx.deletions.has(op.id),false);
 });
+
+function fileByFileDeletion(f,count){
+  // Shift+Delete or rm -rf: Windows reports one deletion per file, each a separate operation.
+  const files=[...f.ctx.items.values()].filter(i=>i.kind==='file').slice(0,count),ops=[];
+  for(const item of files){const op={id:randomUUID(),path:item.path,action:'delete',items:[item],remoteBaseline:[{path:item.path,remoteId:item.remoteId,rev:item.rev}],preparedAt:Date.now()-10000};f.ctx.deletions.set(op.id,op);f.disk.delete(item.path);ops.push(op);}
+  return ops;
+}
+
+test('Shift+Delete of 30 files one by one is held as one batch, not sent file by file',async()=>{
+  const f=await fixture({files:30});fileByFileDeletion(f,30);
+  await finishDeletions(f.providers,f.ctx);
+  assert.deepEqual(f.remote.removed,[],'nothing reached Dropbox');assert.equal(f.reviews.length,1,'one notification');
+  const [confirmation,...rest]=f.providers.status(f.acc).confirmations;assert.equal(rest.length,0,'one decision, not thirty');
+  assert.equal(confirmation.count,30);assert.equal(confirmation.path,'Shots');
+  await f.providers.decide(f.acc,'confirm',confirmation.id);
+  assert.equal(f.remote.removed.length,30);assert.equal(f.ctx.deletions.size,0);
+});
+
+test('cancelling a file-by-file batch brings every file back',async()=>{
+  const f=await fixture({files:30});fileByFileDeletion(f,25);
+  await finishDeletions(f.providers,f.ctx);const [confirmation]=f.providers.status(f.acc).confirmations;
+  await f.providers.decide(f.acc,'cancel',confirmation.id);
+  assert.deepEqual(f.remote.removed,[]);assert.equal(f.ctx.deletions.size,0);assert.equal(f.commands.filter(c=>c.command==='create').length,25);
+});
+
+test('a few files deleted one by one still go straight to Dropbox',async()=>{
+  const f=await fixture({files:30});fileByFileDeletion(f,4);
+  await finishDeletions(f.providers,f.ctx);
+  assert.equal(f.remote.removed.length,4);assert.equal(f.reviews.length,0);
+});
+
+test('deletions arriving after a batch is held join the same batch',async()=>{
+  const f=await fixture({files:40});const first=fileByFileDeletion(f,25);
+  await finishDeletions(f.providers,f.ctx);
+  const later=[...f.ctx.items.values()].filter(i=>i.kind==='file').slice(25,30);
+  for(const item of later){const op={id:randomUUID(),path:item.path,action:'delete',items:[item],remoteBaseline:[{path:item.path,remoteId:item.remoteId,rev:item.rev}],preparedAt:Date.now()-10000};f.ctx.deletions.set(op.id,op);}
+  await finishDeletions(f.providers,f.ctx);
+  const confirmations=f.providers.status(f.acc).confirmations;assert.equal(confirmations.length,1);assert.equal(confirmations[0].count,30);
+  assert.equal(f.reviews.length,1,'still one notification');assert.deepEqual(f.remote.removed,[]);assert.ok(first.length);
+});

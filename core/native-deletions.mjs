@@ -36,18 +36,32 @@ export async function prepareDeletion(provider,ctx,event){
   provider.store.saveNativeDeletion(ctx.acc.id,op);ctx.deletions.set(op.id,op);
 }
 
+// Roadmap 1.11. Explorer sends one deletion per item for Shift+Delete or a script (rm -rf), and one
+// for a whole folder moved to the Recycle Bin. All deletions not yet sent to Dropbox are counted
+// together; at or above the threshold every one of them waits as one batch for this user's decision.
+function holdLargeDeletions(provider,ctx){
+  const open=[...ctx.deletions.values()].filter(op=>!op.confirmed),fresh=open.filter(op=>!op.awaitingConfirmation);
+  if(!fresh.length)return;
+  const total=open.reduce((sum,op)=>sum+(op.remoteBaseline||op.items).length,0);
+  if(!exceedsThreshold(total,ctx.items.size))return;
+  const existing=open.find(op=>op.awaitingConfirmation)?.batch,batch=existing||randomUUID();
+  for(const op of fresh){const waiting={...op,awaitingConfirmation:true,batch};provider.store.saveNativeDeletion(ctx.acc.id,waiting);ctx.deletions.set(op.id,waiting);}
+  if(!existing)provider.onReview?.(ctx.acc,{outbound:{id:batch,path:commonFolder(fresh.map(op=>op.path)),items:fresh.flatMap(op=>op.remoteBaseline||op.items)}});
+}
+export function commonFolder(paths){
+  if(!paths.length)return '';let common=paths[0].split('/');
+  for(const other of paths.slice(1)){const parts=other.split('/');let n=0;while(n<common.length&&n<parts.length&&common[n]===parts[n])n++;common=common.slice(0,n);}
+  return paths.length===1?paths[0]:common.join('/');
+}
 export async function finishDeletions(provider,ctx,{recover=false}={}){
+  if(!recover)holdLargeDeletions(provider,ctx);
   for(const op of [...ctx.deletions.values()].sort((a,b)=>b.path.length-a.path.length)){
     if(op.action==='delete'&&Date.now()-op.preparedAt<3000)continue;
     const source=await ctx.host.request('inspect',{path:op.path});
     if(source.exists&&source.identity===op.items.find(i=>i.path===op.path)?.identity){if(recover){provider.store.deleteNativeDeletion(ctx.acc.id,op.id);ctx.deletions.delete(op.id);}continue;}
     const current=op.items.find(i=>i.path===op.path);
-    // A large folder deleted in Explorer is removed from Dropbox only after this user confirms it.
-    // Until then the local deletion stands and the cloud copy is untouched; cancelling restores it here.
-    if(!op.confirmed&&exceedsThreshold((op.remoteBaseline||op.items).length,ctx.items.size)){
-      if(!op.awaitingConfirmation){const waiting={...op,awaitingConfirmation:true};provider.store.saveNativeDeletion(ctx.acc.id,waiting);ctx.deletions.set(op.id,waiting);provider.onReview?.(ctx.acc,{outbound:waiting});}
-      continue;
-    }
+    // Held for this user's decision: the local deletion stands, Dropbox is untouched.
+    if(op.awaitingConfirmation&&!op.confirmed)continue;
     try{
       if(source.exists)throw deletionConflict('err.deleteLocalReplacement',current);
       if(current.remoteId){if(current.kind==='folder'){

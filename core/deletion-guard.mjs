@@ -1,4 +1,4 @@
-import {copyFile,mkdir,readdir,rm,lstat,constants} from 'node:fs/promises';
+import {copyFile,mkdir,readdir,rm,lstat,statfs,constants} from 'node:fs/promises';
 import path from 'node:path';
 
 // Roadmap 1B/1V decisions (2026-11-04):
@@ -12,6 +12,14 @@ export const QUARANTINE_DAYS=30;
 export function massDeletionThreshold(catalogSize){return Math.max(20,Math.min(50,Math.ceil(0.1*Math.max(0,catalogSize||0))));}
 export const exceedsThreshold=(count,catalogSize)=>count>=massDeletionThreshold(catalogSize);
 
+// Roadmap 4.9: an upload first copies the file into the profile's cache. Refuse early, with a
+// clear message, when that disk cannot hold the copy plus a 256 MB margin.
+export const SPACE_MARGIN=256*1024*1024;
+export async function ensureSpace(directory,bytes,{probe=statfs}={}){
+  let info;try{info=await probe(directory);}catch{return;} // Unknown free space: let the copy itself decide.
+  const free=Number(info.bavail)*Number(info.bsize);
+  if(Number.isFinite(free)&&free<Number(bytes||0)+SPACE_MARGIN)throw Object.assign(new Error('err.diskFull'),{nativeStage:String(Math.max(0,Math.floor(free/1048576)))+' MB'});
+}
 // A placeholder whose bytes are all on this disk: removing it would lose the only local copy.
 export const fullyLocal=state=>!!state?.exists&&!state.directory&&!!state.placeholder&&!state.partial&&Number(state.onDisk)>=Number(state.size);
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {dropboxHash} from './dropbox-transport.mjs';
 import {validateLocalMapping} from './policy.mjs';
-import {fullyLocal} from './deletion-guard.mjs';
+import {fullyLocal,ensureSpace} from './deletion-guard.mjs';
 
 // Roadmap 1B: when local edits cannot be uploaded because Dropbox holds a different version
 // (two artists edited the same file, both created the same name, or the file was deleted in
@@ -46,6 +46,7 @@ export async function resolveConflict(provider,ctx,item,{remote,state,computer=c
     }
     current={...current,conflictCopy:{path:current.conflictCopy?.path||conflictCopyPath(item.path,{computer,time:now}),stage:'uploading'}};
     provider.save(ctx,current); // Persist the intent before anything reaches Dropbox.
+    await ensureSpace(ctx.cache,state.size);
     const file=path.join(ctx.cache,'conflict-'+randomUUID());
     try{
       const snapshot=await ctx.host.request('snapshot',{path:item.path,file});

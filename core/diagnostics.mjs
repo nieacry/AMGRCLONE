@@ -14,7 +14,7 @@ export function diagnosticReport({state,store,arch,osVersion,now=new Date(),devi
     accounts:state.accounts.map(account=>{
       const native=account.native||{};
       return {name:account.name,type:account.accountType||account.scope,
-        provider:{enabled:!!native.enabled,status:native.status||null,error:native.error||null,detail:native.detail||'',lastSync:native.lastSync||null,progress:native.progress||null,canChangeRoot:!!native.canChangeRoot,registered:!!native.registered,initializationFailed:!!native.initializationFailed,skippedFiles:native.skippedFiles||0,catalogItems:native.catalogItems??null,pendingDeletions:native.pendingDeletions??null},
+        provider:{enabled:!!native.enabled,status:native.status||null,error:native.error||null,detail:native.detail||'',lastSync:native.lastSync||null,progress:native.progress||null,canChangeRoot:!!native.canChangeRoot,registered:!!native.registered,initializationFailed:!!native.initializationFailed,skippedFiles:native.skippedFiles||0,catalogItems:native.catalogItems??null,pendingDeletions:native.pendingDeletions??null,metrics:native.metrics||null},
         recentSkipped:store.fileEvents(account.id,{status:'skipped',limit:100}).entries.map(event=>({time:event.time,path:event.path,detail:event.detail,explanation:translate('en',event.detail)})),
         recentErrors:store.fileEvents(account.id,{status:'failed',limit:100}).entries.map(event=>({
           time:event.time,path:event.path,action:event.action,detail:event.detail,

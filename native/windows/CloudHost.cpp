@@ -231,6 +231,9 @@ static JsonObject handleCommand(JsonObject const& cmd){
   if(action=="freezeForReset"){resetNoFetch=true;resetCanceled=false;check(CfDisconnectSyncRoot(connection));connected=false;check(CfConnectSyncRoot(root.c_str(),callbacks,nullptr,CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO|CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,&connection));connected=true;return result;}
   if(action=="cancelReset"){resetCanceled=true;return result;}
   if(action=="inspect")return inspectPath(cmd);
+  // Roadmap 4.6: many paths per request. A path that fails carries its own error code instead of
+  // failing the batch; the caller inspects that one path again to get the full error.
+  if(action=="inspectMany"){JsonArray states;for(auto const& value:cmd.GetNamedArray(L"paths")){JsonObject one;put(one,L"path",winrt::to_string(value.GetString()));try{states.Append(inspectPath(one));}catch(winrt::hresult_error const& error){JsonObject failed;std::ostringstream code;code<<"0x"<<std::hex<<static_cast<unsigned long>(error.code().value);put(failed,L"error",code.str());states.Append(failed);}}result.Insert(L"states",states);return result;}
   if(action=="providerStatus"){check(CfUpdateSyncProviderStatus(connection,jsonBool(cmd,L"busy")?CF_PROVIDER_STATUS_SYNC_INCREMENTAL:CF_PROVIDER_STATUS_IDLE));notifyShell(root);return result;}
   if(action=="transfer"){auto p=full(str(cmd,L"path"));auto identity=str(cmd,L"identity");if(!identity.empty()){std::unique_ptr<Handle> h(attributes(p));requireOwned(h->h,identity);}putn(result,L"shellResult",static_cast<unsigned long>(transferState(p,jsonBool(cmd,L"busy"),static_cast<ULONGLONG>(num(cmd,L"completed")),static_cast<ULONGLONG>(num(cmd,L"total",jsonBool(cmd,L"busy")?1:0)))));return result;}
   if(action=="detachKeepDownloaded"){
