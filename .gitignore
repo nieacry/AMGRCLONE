@@ -1,0 +1,25 @@
+node_modules/
+dist/
+release/
+.runtime/
+test-results/
+*.log
+native/bin/
+publish/
+versions/
+
+# Local tooling and editor state
+.vs/
+.vscode/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+
+# Never commit profiles, databases or credentials
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+vault.bin
+vault.next
+*.conf
+.env

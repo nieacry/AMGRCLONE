@@ -1,0 +1,13 @@
+# 0.16.4 — local-folder recovery action
+
+The local-folder button no longer silently disables itself because a provider is active or saved native metadata exists. A safe empty failed connection can still choose another folder directly. Other native connections open a closeable explanation with **Disconnect only [account]**, followed by the existing explicit disconnect confirmation. This is a reconnect workflow, not an in-place filesystem migration: after disconnect the user signs into the same Dropbox account again and chooses a fresh empty root. Old downloaded copies remain in the previous folder. Other accounts keep working.
+
+Single-account native sign-out now uses the previously tested no-download detach flow. Full downloaded files and ordinary local edits remain on disk, dataless placeholders are removed locally and partial/cache/pending-operation metadata is archived under the private recovery directory. Only the selected account is canceled and its owned drive mappings are disconnected. The whole project is not hydrated just to sign out.
+
+Canceling the sign-out also targets only that account; it does not suspend another account's provider. Global cancellation/reset retains its original all-account behavior.
+
+Failed initialization can carry stale catalog/pending records from previous sessions. These records no longer force a reinitialization of a foreign or inaccessible root during sign-out. The existing native releaseEmpty guard is used unchanged: it cannot unregister a foreign root and refuses a nonempty owned root. The account cache/catalog/intents are archived before its credentials are removed. The native ownership/unregistration implementation has not been modified.
+
+Direct root replacement remains blocked when saved items or pending deletions exist. The diagnostic JSON now includes initialization state, direct-root-change capability and catalog/pending counts so support can identify which condition applies. No file catalog or sign-in credentials are exported.
+
+Coverage includes unit tests for old metadata/pending-intent recovery and direct-replacement guards, plus four isolated UI scenarios: empty failed MIX sign-out, direct retry with another folder, a failed MIX carrying an old catalog/deletion/snapshot, and normal registered MIX sign-out via the folder explanation. All verify continued active Animagrad sync and an unchanged foreign test registration. The registered scenario preserves cached bytes and removes the online-only placeholder locally without downloading it. logout-smoke additionally covers deleted roots, unsent edits, owned drives and no-download reset.

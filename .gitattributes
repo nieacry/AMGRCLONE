@@ -1,0 +1,14 @@
+# Normalize text files in the repository; Windows scripts keep CRLF on checkout.
+* text=auto
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.rc  text eol=crlf
+
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.obj binary
+*.res binary

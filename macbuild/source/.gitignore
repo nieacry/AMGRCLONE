@@ -1,0 +1,9 @@
+node_modules/
+dist/
+release/
+.runtime/
+test-results/
+*.log
+native/bin/
+publish/
+versions/

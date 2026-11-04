@@ -1,0 +1,16 @@
+import {mkdir,writeFile,stat} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import path from 'node:path';
+import {SyncStore} from '../core/store.mjs';
+import {NativeProviders} from '../core/native-provider.mjs';
+import {LocalTransport} from '../core/dropbox-transport.mjs';
+const project=path.resolve(import.meta.dirname,'..'),base=path.join(project,'.runtime/explorer-test',randomUUID().slice(0,8)),root=path.join(base,'Files'),remote=path.join(base,'Remote');
+await mkdir(root,{recursive:true});await mkdir(path.join(remote,'Cloud folder'),{recursive:true});
+for(const name of ['Online only.txt','Downloaded.txt','Pending upload.txt'])await writeFile(path.join(remote,name),'Explorer status fixture\n');
+await writeFile(path.join(remote,'Cloud folder','Nested.txt'),'Nested online data');
+const store=new SyncStore(path.join(base,'sync.sqlite')),acc={id:'explorer-test',name:'Explorer status test',settings:{localRoot:'',rules:{'':{selected:true,mode:'online',kind:'folder'},'Downloaded.txt':{selected:true,mode:'local',kind:'file'},'Pending upload.txt':{selected:true,mode:'local',kind:'file'}}},native:{enabled:true,root,owner:randomUUID()}};
+const providers=new NativeProviders({binary:path.join(project,'native/bin/amg-cloud.exe'),dataDir:base,store,transport:()=>new LocalTransport(remote),persist:async()=>{}});
+await providers.refresh(acc);providers.paused=true;await writeFile(path.join(root,'Pending upload.txt'),'Changed locally, pending upload');
+await providers.contexts.get(acc.id).host.request('transfer',{path:'Pending upload.txt',busy:true,total:100});
+await writeFile(path.join(project,'.runtime/explorer-current.json'),JSON.stringify({root,base,owner:acc.native.owner}));console.log('Explorer fixture ready: '+root);
+const timer=setInterval(async()=>{if(!await stat(path.join(base,'stop')).catch(()=>null))return;clearInterval(timer);try{await providers.detach(acc);console.log('Explorer test root detached; original test bytes preserved');}finally{await providers.close();store.close();process.exit();}},500);

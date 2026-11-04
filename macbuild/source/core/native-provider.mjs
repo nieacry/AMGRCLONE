@@ -1,0 +1,201 @@
+import {mkdir,readdir,lstat,readFile,writeFile,unlink,utimes,realpath} from 'node:fs/promises';
+import {watch} from 'node:fs';
+import {createHash,randomUUID} from 'node:crypto';
+import path from 'node:path';
+import {itemIdentity as identity,deleting,recoverPlaceholder,prepareDeletion,finishDeletions} from './native-deletions.mjs';
+import {missingRoot} from './account-recovery.mjs';
+import {NativeHost,retryableNativeError} from './native-host.mjs';
+import {contains,effectivePolicy,validateLocalMapping,validateRemotePath} from './policy.mjs';
+import {dropboxHash} from './dropbox-transport.mjs';
+import {nativeAvailabilityStates,nativeFileStatus} from './native-availability.mjs';
+
+const order=(a,b)=>a.path.split('/').length-b.path.split('/').length||a.path.localeCompare(b.path);
+export function selectedRoots(rules){return Object.keys(rules).filter(p=>rules[p].selected).sort((a,b)=>a.length-b.length).filter((p,_i,all)=>!all.some(parent=>parent!==p&&contains(parent,p)));}
+function supported(relative){validateLocalMapping(relative,'win32');return !relative.split('/').some(p=>p.toLowerCase()==='.amg-backups'||p.startsWith('.amg-access-'));}
+export class NativeProviders {
+  constructor({binary,dataDir,store,transport,persist}){this.binary=binary;this.dataDir=dataDir;this.store=store;this.transport=transport;this.persist=persist;this.contexts=new Map();this.closed=false;this.paused=false;}
+  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()],orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0);return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canChangeRoot:ctx.failed&&ctx.items.size===0,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts}};}
+  save(ctx,item){ctx.items.set(item.key,item);this.store.saveNativeItem(ctx.acc.id,item);return item;}
+  async itemStates(acc,paths){
+    const ctx=this.contexts.get(acc.id);if(!ctx||ctx.closed||ctx.failed||!ctx.host||acc.native?.resetting)return nativeAvailabilityStates([],paths);
+    const items=[...ctx.items.values()],requested=new Set(paths),files=items.filter(item=>item.kind==='file'&&requested.has(item.path)&&['online','cached','pinned','dirty'].includes(item.status)),fresh=new Map();let next=0;
+    // Attribute inspection reads no file contents and runs even while background sync is paused.
+    await Promise.all(Array.from({length:Math.min(4,files.length)},async()=>{while(next<files.length){const item=files[next++];try{const actual=await ctx.host.request('inspect',{path:item.path});fresh.set(item.path,{...item,status:actual.exists&&actual.placeholder&&actual.identity===item.identity?nativeFileStatus(actual):'unknown'});}catch{fresh.set(item.path,{...item,status:'unknown'});}}}));
+    return nativeAvailabilityStates(items.map(item=>fresh.get(item.path)||item),paths,[...ctx.fetches.values(),...ctx.uploads].map(controller=>controller.nativePath).filter(Boolean));
+  }
+  async start(acc){
+    const previous=this.contexts.get(acc.id);if(previous){if(!previous.failed)return previous.ready;await previous.host?.close();this.contexts.delete(acc.id);}
+    const cache=path.join(this.dataDir,'native-cache',acc.id);
+    const ctx={acc,host:null,cache,remote:this.transport(acc),items:new Map(this.store.nativeItems(acc.id).map(i=>[i.key,i])),deletions:new Map(this.store.nativeDeletions(acc.id).map(op=>[op.id,op])),fetches:new Map(),uploads:new Set(),queue:Promise.resolve(),busy:true,error:null,detail:'',lastChecked:null,needsReconcile:true,retry:null,closed:false,failed:false};
+    this.contexts.set(acc.id,ctx);
+    ctx.ready=(async()=>{try{if(await missingRoot(acc.native.root))throw new Error('err.nativeRootMissing');await mkdir(cache,{recursive:true,mode:0o700});if(this.closed||ctx.closed)throw new Error('err.nativeStopped');ctx.host=new NativeHost(this.binary);
+      ctx.host.on('event',event=>this.event(ctx,event).catch(error=>this.recordError(ctx,error)));
+      ctx.host.on('stopped',()=>{if(!ctx.closed)this.recordError(ctx,new Error('err.nativeStopped'));});
+      ctx.registration=await ctx.host.request('init',{root:acc.native.root,cache,owner:acc.native.owner,displayName:acc.name});ctx.shell=await ctx.host.request('checkPath',{path:acc.native.root});if(ctx.closed)throw new Error('err.nativeStopped');
+      if(!(acc.native.resetting&&acc.native.resetMode==='keepDownloaded'))await finishDeletions(this,ctx,{recover:true}).catch(error=>this.recordError(ctx,error));
+      ctx.watcher=watch(acc.native.root,{recursive:true},()=>{ctx.changed=true;});ctx.watcher.on('error',error=>this.recordError(ctx,error));
+      ctx.timer=setInterval(()=>this.background(ctx).catch(()=>{}),5000);
+      ctx.busy=false;return ctx;
+    }catch(error){ctx.busy=false;ctx.failed=true;this.recordError(ctx,error);throw error;}})();
+    return ctx.ready;
+  }
+  log(ctx,item,action,direction='none',status='succeeded',detail='',target=''){this.store.addFileEvent(ctx.acc.id,{path:item.path,kind:item.kind,size:item.size,action,direction,status,detail,target});}
+  async background(ctx){
+    if(ctx.busy||ctx.closed||ctx.suspended||this.paused||ctx.acc.native?.resetting)return;
+    const due=ctx.needsReconcile||!ctx.lastChecked||Date.now()-ctx.lastChecked>=60000;
+    if(!ctx.changed&&!due&&!ctx.deletions.size)return;
+    await this.serial(ctx,async()=>{ctx.changed=false;await finishDeletions(this,ctx);await this.scan(ctx);if(due)await this.reconcile(ctx);});
+  }
+  recordError(ctx,error){ctx.needsReconcile=true;if(error.message==='err.canceled')return;if(retryableNativeError(error)){ctx.retry=error;return;}ctx.error=error.message?.startsWith('err.')?error.message:'err.native';ctx.detail=[error.nativeCode,error.nativeCommand,error.nativeStage,error.nativePath].filter(Boolean).join(' · ');const signature=ctx.error+'|'+ctx.detail;if(ctx.lastErrorLog!==signature){ctx.lastErrorLog=signature;this.store.addFileEvent(ctx.acc.id,{path:error.nativePath||'',action:['upload','download','delete','recycle','rename','update','local','online'].includes(error.nativeCommand)?error.nativeCommand:'sync',direction:'none',status:'failed',detail:ctx.error+(ctx.detail?' · '+ctx.detail:'')});}}
+  serial(ctx,action){const generation=ctx.cancelGeneration||0;const result=ctx.queue.then(async()=>{if(ctx.closed)throw new Error('err.nativeStopped');if(generation!==(ctx.cancelGeneration||0))throw new Error('err.canceled');const operation=new AbortController();ctx.operation=operation;ctx.busy=true;ctx.error=null;ctx.detail='';ctx.retry=null;ctx.checkedThisRun=false;await ctx.host.request('providerStatus',{busy:true}).catch(()=>{});try{operation.signal.throwIfAborted();const value=await action();operation.signal.throwIfAborted();if(!ctx.error)ctx.lastErrorLog=null;await this.finishCheck(ctx);return value;}catch(error){if(operation.signal.aborted)throw new Error('err.canceled');this.recordError(ctx,error);throw error;}finally{ctx.busy=false;ctx.progress=null;ctx.operation=null;await ctx.host.request('providerStatus',{busy:false}).catch(()=>{});}});ctx.queue=result.catch(()=>{});return result;}
+  async refresh(acc){
+    const ctx=await this.start(acc);if(acc.native?.resetting)throw new Error('err.reset');
+    if(ctx.refreshing){ctx.refreshAgain=true;return ctx.refreshing;}ctx.suspended=false;
+    const refresh=(async()=>{do{ctx.refreshAgain=false;await this.serial(ctx,async()=>{await finishDeletions(this,ctx);await this.scan(ctx);await this.reconcile(ctx);});}while(ctx.refreshAgain&&!ctx.closed&&!ctx.suspended&&!this.paused);return this.status(acc);})();ctx.refreshing=refresh;
+    try{return await refresh;}catch(error){if(retryableNativeError(error))return this.status(acc);throw error;}finally{if(ctx.refreshing===refresh)ctx.refreshing=null;}
+  }
+  async collect(ctx,rules=ctx.acc.settings.rules){
+    const roots=selectedRoots(rules),all=new Map(),signal=ctx.operation?.signal;ctx.progress={phase:'listing',completed:0};
+    for(const relative of roots){signal?.throwIfAborted();validateRemotePath(relative);if(relative&&!supported(relative))continue;const top=relative?{path:relative,...await ctx.remote.metadata(relative,{signal})}:{kind:'folder'};if(relative)all.set(relative,top);const prior=all.size;if(top.kind==='folder')for(const item of await ctx.remote.list(relative,true,{signal,onProgress:count=>{ctx.progress={phase:'listing',completed:prior+count};}})){signal?.throwIfAborted();if(!supported(item.path))continue;if(effectivePolicy(item.path,rules).selected)all.set(item.path,item);}}
+    for(const item of [...all.values()]){signal?.throwIfAborted();const parts=item.path.split('/');parts.pop();while(parts.length){const parent=parts.join('/');if(!all.has(parent))all.set(parent,{path:parent,...await ctx.remote.metadata(parent,{signal})});parts.pop();}}
+    const seen=new Set();for(const item of all.values()){if(!supported(item.path))throw new Error('err.mapping');const canonical=item.path.normalize('NFC').toLowerCase();if(seen.has(canonical))throw new Error('err.mapping');seen.add(canonical);}
+    return [...all.values()].sort(order);
+  }
+  async reconcile(ctx){
+    const rules=structuredClone(ctx.acc.settings.rules),listing=await this.collect(ctx,rules),seen=new Set(),byRemoteId=new Map([...ctx.items.values()].map(item=>[item.remoteId,item]));ctx.operation?.signal.throwIfAborted();ctx.progress={phase:'placeholders',completed:0,total:listing.length};
+    for(const remote of listing){
+      ctx.operation?.signal.throwIfAborted();ctx.progress.completed++;
+      if(deleting(ctx,remote.path))continue;
+      let existing=byRemoteId.get(remote.remoteId);let item=existing?{...existing}: {...remote,key:randomUUID(),status:'creating'};
+      seen.add(item.key);const priorIdentity=existing?.identity;
+      if(existing&&existing.path!==remote.path){
+        const atNew=await ctx.host.request('inspect',{path:remote.path});
+        if(!atNew.exists)await ctx.host.request('moveLocal',{path:existing.path,target:remote.path,identity:existing.identity});
+        else if(atNew.identity!==existing.identity){this.save(ctx,{...existing,status:'conflict'});continue;}
+        item.path=remote.path;
+      }
+      const state=await ctx.host.request('inspect',{path:remote.path});
+      if(state.exists&&existing&&(!state.placeholder||!state.inSync)&&existing.status!=='creating'){
+        if(remote.rev!==existing.rev)this.save(ctx,{...existing,status:'conflict'});
+        continue;
+      }
+      item={...item,...remote};item.identity=identity(item);
+      if(!existing)this.save(ctx,item); // Persist creation intent before creating an OS placeholder.
+      if(!state.exists){await ctx.host.request('create',{path:item.path,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'placeholder','download');}
+      else if(!state.placeholder){this.save(ctx,{...item,status:'conflict'});continue;}
+      else if(state.identity!==(priorIdentity||item.identity)){this.save(ctx,{...item,status:'conflict'});continue;}
+      else if(existing&&item.identity!==priorIdentity){await ctx.host.request('update',{path:item.path,previousIdentity:priorIdentity,identity:item.identity,directory:item.kind==='folder',size:item.size,modified:item.modified});this.log(ctx,item,'updated','download');}
+      item=this.save(ctx,item);
+      if(item.kind==='file'){
+        const desired=effectivePolicy(item.path,rules).mode;
+        const current=await ctx.host.request('inspect',{path:item.path});
+        if(desired==='local'&&(current.partial||current.pin!==1))await ctx.host.request('availability',{path:item.path,identity:item.identity,mode:'local'},86400000);
+        else if(desired==='online'&&current.pin===1)await ctx.host.request('availability',{path:item.path,identity:item.identity,mode:'online'});
+        const actual=await ctx.host.request('inspect',{path:item.path});this.save(ctx,{...item,status:nativeFileStatus(actual)});
+      }else this.save(ctx,{...item,status:'cached'});
+    }
+    // A changed selection invalidates this snapshot for removals; the queued refresh will use the new rules.
+    if(JSON.stringify(rules)!==JSON.stringify(ctx.acc.settings.rules)){ctx.needsReconcile=true;ctx.refreshAgain=true;return;}
+    for(const item of [...ctx.items.values()].filter(i=>!seen.has(i.key)&&i.status!=='orphaned'&&!deleting(ctx,i.path)).sort((a,b)=>order(b,a))){
+      ctx.operation?.signal.throwIfAborted();
+      const state=await ctx.host.request('inspect',{path:item.path});
+      if(state.exists){if(!state.placeholder||state.identity!==item.identity||!state.inSync||state.dirtyBytes){this.save(ctx,{...item,status:'conflict'});continue;}await ctx.host.request('remove',{path:item.path,identity:item.identity});}
+      ctx.items.delete(item.key);this.store.deleteNativeItem(ctx.acc.id,item.key);this.log(ctx,item,'delete','download');
+    }
+    for(const item of ctx.items.values()){ctx.operation?.signal.throwIfAborted();if(item.kind==='folder'&&item.status!=='conflict'&&item.status!=='orphaned'&&!deleting(ctx,item.path))await ctx.host.request('folderAvailability',{path:item.path,identity:item.identity,mode:effectivePolicy(item.path,rules).mode});}
+    ctx.lastChecked=Date.now();ctx.checkedThisRun=true;ctx.needsReconcile=!!ctx.retry;
+  }
+  async finishCheck(ctx){if(ctx.checkedThisRun&&!ctx.acc.native.resetting&&!ctx.deletions?.size&&!ctx.error&&!ctx.retry&&!ctx.fetches.size&&!ctx.uploads.size&&![...ctx.items.values()].some(i=>['dirty','conflict','creating','pendingRename','orphaned'].includes(i.status))){ctx.acc.native.lastSync=ctx.lastChecked;await this.persist();}}
+  async scan(ctx){
+    const paths=[],byPath=new Map([...ctx.items.values()].map(item=>[item.path,item]));const walk=async relative=>{ctx.operation?.signal.throwIfAborted();for(const info of await readdir(path.join(ctx.acc.native.root,...relative.split('/')),{withFileTypes:true})){ctx.operation?.signal.throwIfAborted();const child=relative?relative+'/'+info.name:info.name;if(info.isSymbolicLink())throw new Error('err.link');paths.push(child);if(info.isDirectory())await walk(child);}};await walk('');
+    for(const relative of paths.sort((a,b)=>a.split('/').length-b.split('/').length)){
+      ctx.operation?.signal.throwIfAborted();
+      if(deleting(ctx,relative)||!supported(relative)||!effectivePolicy(relative,ctx.acc.settings.rules).selected)continue;
+      let known=byPath.get(relative);let actual=await ctx.host.request('inspect',{path:relative});if(!actual.exists)continue;
+      if(known?.status==='conflict'||known?.status==='orphaned')continue;
+      if(known?.status==='pendingRename'){await this.finishRename(ctx,known);continue;}
+      if(actual.placeholder){if(!known){known=await recoverPlaceholder(this,ctx,relative,actual);if(known.status==='orphaned')continue;}if(actual.identity!==known.identity){ctx.error='err.nativeConflict';continue;}if(actual.inSync){const status=actual.directory?'cached':nativeFileStatus(actual);if(known.status!==status)this.save(ctx,{...known,status});continue;}}
+      if(known?.status==='creating')continue;
+      if(actual.directory){if(!known){const remote=await ctx.remote.createFolder(relative);known={key:randomUUID(),path:relative,...remote,status:'creating'};known.identity=identity(known);this.save(ctx,known);const committed=await ctx.host.request('commit',{path:relative,identity:known.identity,stamp:actual.stamp,directory:true});if(committed.committed){this.save(ctx,{...known,status:'cached'});ctx.needsReconcile=true;this.log(ctx,known,'upload','upload');}}continue;}
+      if(actual.placeholder&&(actual.partial||actual.onDisk<actual.size)){await ctx.host.request('availability',{path:relative,identity:known.identity,mode:'local'},86400000);actual=await ctx.host.request('inspect',{path:relative});if(actual.partial||actual.onDisk<actual.size)throw new Error('err.nativeConflict');}
+      if(known)this.save(ctx,{...known,status:'dirty'});
+      const file=path.join(ctx.cache,'snapshot-'+randomUUID());
+      await ctx.host.request('transfer',{path:relative,identity:known?.identity||'',busy:true}).catch(()=>{});
+      try{
+        let snapshot;try{snapshot=await ctx.host.request('snapshot',{path:relative,file});}catch(error){if(retryableNativeError(error)){this.recordError(ctx,error);continue;}throw error;}
+        await utimes(file,new Date(snapshot.modified),new Date(snapshot.modified));const checksum=await dropboxHash(file),uploadAbort=new AbortController();uploadAbort.nativePath=relative;ctx.uploads.add(uploadAbort);let remote;try{remote=await ctx.remote.upload(relative,file,known,{signal:uploadAbort.signal});}catch(error){if(uploadAbort.signal.aborted)throw new Error('err.canceled');throw error;}finally{ctx.uploads.delete(uploadAbort);}
+        if(remote.hash!==checksum)throw new Error('err.nativeConflict');
+        const item={...known,key:known?.key||randomUUID(),path:relative,...remote,status:'dirty'};const nextIdentity=identity(item);item.identity=known?.identity||nextIdentity;this.save(ctx,item);
+        const committed=await ctx.host.request('commit',{path:relative,previousIdentity:known?.identity||'',identity:nextIdentity,stamp:snapshot.stamp});this.save(ctx,{...item,identity:committed.committed?nextIdentity:item.identity,status:committed.committed?'cached':'dirty'});ctx.needsReconcile=true;this.log(ctx,item,'upload','upload');
+      }catch(error){error.nativePath||=relative;error.nativeCommand||='upload';if(known)this.save(ctx,{...known,status:error.message==='err.nativeConflict'?'conflict':'dirty'});throw error;}
+      finally{await ctx.host.request('transfer',{path:relative,busy:false}).catch(()=>{});await unlink(file).catch(()=>{});}
+    }
+  }
+  async event(ctx,event){
+    if(event.event==='cancel'){ctx.fetches.get(event.request)?.abort();return;}
+    if(event.event==='changed'){ctx.changed=true;return;}
+    if(event.event==='completed'){if(ctx.acc.native?.resetting)return;await this.serial(ctx,()=>finishDeletions(this,ctx));return;}
+    if(event.event==='nativeError'){const error=new Error('err.nativeMoveOut');error.nativeCommand=event.operation;this.recordError(ctx,error);return;}
+    if(event.event==='fetch'){
+      if(ctx.noDownloadReset||(ctx.acc.native?.resetting&&ctx.acc.native.resetMode==='keepDownloaded')){await ctx.host.request('fail',{request:event.request}).catch(()=>{});return;}
+      const source=[...ctx.items.values()].find(i=>i.identity===event.identity);if(!source){await ctx.host.request('fail',{request:event.request}).catch(()=>{});return;}
+      const item={...source},controller=new AbortController();controller.nativePath=item.path;ctx.fetches.set(event.request,controller);
+      try{
+        const offset=Math.floor(event.offset/4096)*4096,end=Math.min(item.size,event.length<0?item.size:Math.ceil((event.offset+event.length)/4096)*4096),length=end-offset;
+        const stream=await ctx.remote.download(item,{offset,length,signal:controller.signal});let buffer=Buffer.alloc(0),position=offset;
+        const deliver=async(data,final)=>{const file=path.join(ctx.cache,'chunk-'+randomUUID());await writeFile(file,data,{flag:'wx',mode:0o600});try{await ctx.host.request('supply',{request:event.request,file,offset:position,final});position+=data.length;}finally{await unlink(file).catch(()=>{});}};
+        for await(const value of stream){if(controller.signal.aborted)throw new Error('err.canceled');buffer=Buffer.concat([buffer,Buffer.from(value)]);while(buffer.length>=1024*1024){const chunk=buffer.subarray(0,1024*1024);buffer=buffer.subarray(1024*1024);if(position+chunk.length>end)throw new Error('err.nativeNetwork');await deliver(chunk,position+chunk.length===end);}}
+        if(buffer.length){if(position+buffer.length!==end)throw new Error('err.nativeNetwork');await deliver(buffer,true);}if(position!==end)throw new Error('err.nativeNetwork');if(!ctx.lastDownloads)ctx.lastDownloads=new Map();if(!ctx.lastDownloads.has(item.identity)||Date.now()-ctx.lastDownloads.get(item.identity)>5000){this.log(ctx,item,'download','download');ctx.lastDownloads.set(item.identity,Date.now());}
+      }catch(error){await ctx.host.request('fail',{request:event.request}).catch(()=>{});if(!controller.signal.aborted){error.nativePath=item.path;error.nativeCommand='download';this.recordError(ctx,error);}}
+      finally{ctx.fetches.delete(event.request);if(!ctx.closed)try{const actual=await ctx.host.request('inspect',{path:item.path}),current=ctx.items.get(item.key);if(!ctx.closed&&current?.identity===item.identity&&actual.exists&&actual.placeholder&&actual.identity===item.identity&&['online','cached','pinned'].includes(current.status))this.save(ctx,{...current,status:nativeFileStatus(actual)});}catch{/* A later metadata scan can refresh a busy or closing file. */}}
+      return;
+    }
+    if(['delete','recycle'].includes(event.event)){
+      if(ctx.acc.native?.resetting){await ctx.host.request('ack',{request:event.request,allow:false});return;}
+      try{await this.serial(ctx,()=>prepareDeletion(this,ctx,event));await ctx.host.request('ack',{request:event.request,allow:true});}catch(error){error.nativePath=event.path;error.nativeCommand=event.event;this.recordError(ctx,error);await ctx.host.request('ack',{request:event.request,allow:false}).catch(()=>{});}return;
+    }
+    if(event.event==='rename'){
+      if(ctx.acc.native?.resetting){await ctx.host.request('ack',{request:event.request,allow:false});return;}
+      try{await this.serial(ctx,async()=>{
+        const current=[...ctx.items.values()].find(i=>i.identity===event.identity||i.path===event.path.replaceAll('\\','/'));
+        if(!current)return;
+        const affected=[...ctx.items.values()].filter(i=>contains(current.path,i.path));for(const item of affected){const state=await ctx.host.request('inspect',{path:item.path});const renameOnly=item.status==='pendingRename'&&!state.dirtyBytes&&state.size===item.size&&Math.abs(state.modified-item.modified)<=1000;if(state.exists&&((!state.inSync&&!renameOnly)||state.dirtyBytes))throw new Error('err.nativeConflict');}
+        {const target=event.target.replaceAll('\\','/');if(!supported(target))throw new Error('err.mapping');if(!effectivePolicy(target,ctx.acc.settings.rules).selected&&!ctx.acc.settings.rules[current.path]?.selected)throw new Error('err.nativeSelection');const moved=await ctx.remote.move(current,target);this.log(ctx,current,'rename','upload','succeeded','',target);for(const item of affected){const changed={...item,...(item.key===current.key?moved:{}),path:target+item.path.slice(current.path.length),status:'pendingRename'};changed.pendingIdentity=identity(changed);this.save(ctx,changed);}const rules={};for(const [p,rule]of Object.entries(ctx.acc.settings.rules))rules[contains(current.path,p)?target+p.slice(current.path.length):p]=rule;ctx.acc.settings.rules=rules;await this.persist();}
+      });await ctx.host.request('ack',{request:event.request,allow:true});}catch(error){this.recordError(ctx,error);await ctx.host.request('ack',{request:event.request,allow:false}).catch(()=>{});}
+    }
+  }
+  async finishRename(ctx,item){await ctx.host.request('markMetadata',{path:item.path,previousIdentity:item.identity,identity:item.pendingIdentity||item.identity,size:item.size,modified:item.modified,directory:item.kind==='folder'});const next={...item,identity:item.pendingIdentity||item.identity,status:'cached'};delete next.pendingIdentity;this.save(ctx,next);}
+  async forgetEmpty(acc){const ctx=this.contexts.get(acc.id);if(!ctx||!ctx.failed||ctx.items.size)throw new Error('err.nativeExclusive');await ctx.host?.request('releaseEmpty');ctx.closed=true;await ctx.host?.close();this.contexts.delete(acc.id);}
+  async releaseEmptyRoot(acc){
+    const ctx=await this.start(acc);await this.serial(ctx,async()=>{
+      if(ctx.items.size||ctx.deletions.size||ctx.fetches.size||ctx.uploads.size||this.store.nativeItems(acc.id).length||this.store.nativeDeletions(acc.id).length||(await readdir(acc.native.root)).length||(await readdir(ctx.cache)).some(name=>name!=='index-scope.txt'))throw new Error('err.accountRootBusy');
+      await ctx.host.request('releaseEmpty');ctx.closed=true;clearInterval(ctx.timer);ctx.watcher?.close();
+    });await ctx.host.close();ctx.remote.cancel?.();this.contexts.delete(acc.id);
+  }
+  async availability(acc,relative,mode){const ctx=await this.start(acc);try{return await this.serial(ctx,async()=>{await finishDeletions(this,ctx);await this.scan(ctx);await this.reconcile(ctx);for(const item of [...ctx.items.values()].filter(i=>i.kind==='file'&&contains(relative,i.path))){await ctx.host.request('availability',{path:item.path,identity:item.identity,mode},86400000);const actual=await ctx.host.request('inspect',{path:item.path});this.save(ctx,{...item,status:nativeFileStatus(actual)});this.log(ctx,item,mode,'none');}return this.status(acc);});}catch(error){if(retryableNativeError(error))return this.status(acc);throw error;}}
+  async detachInactiveEmpty(acc){
+    const previous=this.contexts.get(acc.id);
+    if(this.store.nativeItems(acc.id).length||this.store.nativeDeletions(acc.id).length||(await readdir(acc.native.root)).length)return false;
+    const cache=path.join(this.dataDir,'native-cache',acc.id),files=await readdir(cache).catch(error=>{if(error.code==='ENOENT')return [];throw error;});if(files.some(name=>name!=='index-scope.txt'))throw new Error('err.reset');if(previous&&!previous.failed)return false;
+    if(previous){previous.closed=true;clearInterval(previous.timer);previous.watcher?.close();await previous.ready.catch(()=>{});await previous.host?.close();await previous.queue.catch(()=>{});this.contexts.delete(acc.id);}
+    const host=new NativeHost(this.binary);try{await host.request('releaseInactiveEmpty',{root:acc.native.root,cache,owner:acc.native.owner});return true;}finally{await host.close();}
+  }
+  async detach(acc,{keepDownloaded=false}={}){if(await missingRoot(acc.native.root)){const stale=this.contexts.get(acc.id);if(stale){stale.closed=true;clearInterval(stale.timer);stale.watcher?.close();stale.remote.cancel?.();await stale.ready.catch(()=>{});await stale.host?.close();await stale.queue.catch(()=>{});this.contexts.delete(acc.id);}return {missing:true};}if(keepDownloaded){
+      const completed=await readFile(path.join(this.dataDir,'native-cache',acc.id,'reset-complete.json'),'utf8').then(JSON.parse).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+      if(completed&&path.resolve(completed.root).toLowerCase()===path.resolve(acc.native.root).toLowerCase()&&completed.owner==='AMG.CloudFiles/'+acc.native.owner&&!await this.isManagedRoot(acc.native.root))return {missing:false};
+    }
+    if(await this.detachInactiveEmpty(acc))return {missing:false};const ctx=await this.start(acc);
+    if(keepDownloaded){ctx.noDownloadReset=true;this.cancelAccount(acc.id);}
+    await this.serial(ctx,async()=>{
+      if(keepDownloaded)await ctx.host.request('freezeForReset');
+      if(!keepDownloaded){await finishDeletions(this,ctx);if(ctx.deletions.size)throw new Error('err.nativePendingDeletion');}
+      else{for(let attempt=0;ctx.fetches.size||ctx.uploads.size;attempt++){ctx.operation.signal.throwIfAborted();if(attempt>=600)throw new Error('err.resetBusy');await new Promise(resolve=>setTimeout(resolve,50));}}
+      ctx.detachKeep=keepDownloaded;try{await ctx.host.request(keepDownloaded?'detachKeepDownloaded':'detach',{items:[...ctx.items.values()].map(({path,identity})=>({path,identity})),...(keepDownloaded?{recovery:path.join(ctx.cache,'reset-recovery')}:{})},86400000);}finally{ctx.detachKeep=false;}
+    });ctx.closed=true;clearInterval(ctx.timer);ctx.watcher?.close();await ctx.host.close();ctx.remote.cancel?.();this.contexts.delete(acc.id);return {missing:false};}
+  async isManagedRoot(root){const host=new NativeHost(this.binary);try{return (await host.request('checkPath',{path:root})).registered;}finally{await host.close();}}
+  async drives(){const ctx=[...this.contexts.values()].find(c=>c.host&&!c.host.closed);if(ctx){await ctx.ready;return ctx.host.request('drives');}const host=new NativeHost(this.binary);try{return await host.request('drives');}finally{await host.close();}}
+  setPaused(value){this.paused=value;if(value)this.cancel();else for(const ctx of this.contexts.values())ctx.suspended=false;}
+  cancelAccount(id){const ctx=this.contexts.get(id);if(!ctx)return;ctx.cancelGeneration=(ctx.cancelGeneration||0)+1;ctx.suspended=true;ctx.needsReconcile=true;ctx.operation?.abort(new Error('err.canceled'));for(const controller of ctx.fetches.values())controller.abort();for(const controller of ctx.uploads)controller.abort();if(ctx.detachKeep)ctx.host.request('cancelReset').catch(()=>{});}
+  cancel(){for(const id of this.contexts.keys())this.cancelAccount(id);}
+  async close(){this.closed=true;this.cancel();for(const ctx of this.contexts.values()){ctx.remote.cancel?.();ctx.closed=true;await ctx.ready.catch(()=>{});clearInterval(ctx.timer);ctx.watcher?.close();await ctx.host?.close();await ctx.queue.catch(()=>{});}}
+}
