@@ -159,7 +159,8 @@ for(const [summary,expected] of [['path/too_many_write_operations/..','dirty'],[
     const f=providerFixture({upload:async()=>{throw dropboxError(409,summary);}}),known={key:'k1',path:'a.txt',kind:'file',remoteId:'id:a',rev:'r1',identity:'k1@x',size:4,status:'cached'};
     f.ctx.items.set(known.key,known);f.disk.set('a.txt',edited);
     f.ctx.acc.native.root=path.resolve(import.meta.dirname,'../.runtime/dropbox-errors/root');await writeFile(path.join(f.ctx.acc.native.root,'a.txt'),'data');
-    await assert.rejects(f.providers.scan(f.ctx));
+    // A version conflict is recorded and the scan goes on with other files; other failures stop it.
+    if(expected==='conflict')await f.providers.scan(f.ctx);else await assert.rejects(f.providers.scan(f.ctx));
     assert.equal(f.saved.get('k1').status,expected);
   });
 }

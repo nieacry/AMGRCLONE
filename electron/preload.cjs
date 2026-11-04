@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('cloudlane', Object.freeze({
   nativeAvailability: (id, path, mode) => invoke('nativeAvailability', id, path, mode),
   nativeReview: (id, action, operationId) => invoke('nativeReview', id, action, operationId),
   openQuarantine: id => invoke('openQuarantine', id),
+  showInFolder: (id, path) => invoke('showInFolder', id, path),
   chooseDriveFolder: id => invoke('chooseDriveFolder', id),
   driveLetters: () => invoke('driveLetters'),
   createDrive: (id, path, letter) => invoke('createDrive', id, path, letter),

@@ -10,6 +10,7 @@ import {dropboxHash} from './dropbox-transport.mjs';
 import {nativeAvailabilityStates,nativeFileStatus} from './native-availability.mjs';
 import {skippableMapping,mappingBlocks,blockedPath,containsSkipped} from './native-skips.mjs';
 import {setImmediate as yieldToEventLoop} from 'node:timers/promises';
+import {resolvable,resolveConflict} from './conflicts.mjs';
 import {exceedsThreshold,fullyLocal,quarantineFile,pruneQuarantine,reviewSummary,quarantineRoot} from './deletion-guard.mjs';
 
 const order=(a,b)=>a.path.split('/').length-b.path.split('/').length||a.path.localeCompare(b.path);
@@ -17,7 +18,7 @@ export function selectedRoots(rules){return Object.keys(rules).filter(p=>rules[p
 function supported(relative){validateLocalMapping(relative,'win32');return !relative.split('/').some(p=>p.toLowerCase()==='.amg-backups'||p.startsWith('.amg-access-'));}
 export class NativeProviders {
   constructor({binary,dataDir,store,transport,persist,onReview}){this.binary=binary;this.dataDir=dataDir;this.store=store;this.transport=transport;this.persist=persist;this.onReview=onReview;this.contexts=new Map();this.closed=false;this.paused=false;}
-  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,awaiting=[...(ctx.deletions?.values()||[])].filter(op=>op.awaitingConfirmation&&!op.confirmed),pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0)-awaiting.length;return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts},review:ctx.review&&!ctx.review.approved?{id:ctx.review.id,created:ctx.review.created,...reviewSummary(ctx.review.items)}:null,confirmations:awaiting.map(op=>({id:op.id,path:op.path,action:op.action,count:(op.remoteBaseline||op.items).length,preparedAt:op.preparedAt}))};}
+  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,awaiting=[...(ctx.deletions?.values()||[])].filter(op=>op.awaitingConfirmation&&!op.confirmed),pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0)-awaiting.length;return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts,conflictCopies:ctx.conflictCopies||0},review:ctx.review&&!ctx.review.approved?{id:ctx.review.id,created:ctx.review.created,...reviewSummary(ctx.review.items)}:null,confirmations:awaiting.map(op=>({id:op.id,path:op.path,action:op.action,count:(op.remoteBaseline||op.items).length,preparedAt:op.preparedAt}))};}
   save(ctx,item){ctx.items.set(item.key,item);this.store.saveNativeItem(ctx.acc.id,item);return item;}
   async itemStates(acc,paths){
     const ctx=this.contexts.get(acc.id);if(!ctx||ctx.closed||ctx.failed||!ctx.host||acc.native?.resetting)return nativeAvailabilityStates([],paths);
@@ -29,7 +30,7 @@ export class NativeProviders {
   async start(acc){
     const previous=this.contexts.get(acc.id);if(previous){if(!previous.failed)return previous.ready;await previous.host?.close();this.contexts.delete(acc.id);}
     const cache=path.join(this.dataDir,'native-cache',acc.id);
-    const ctx={acc,host:null,cache,review:this.store.nativeReview?.(acc.id)||null,remote:this.transport(acc),items:new Map(this.store.nativeItems(acc.id).map(i=>[i.key,i])),deletions:new Map(this.store.nativeDeletions(acc.id).map(op=>[op.id,op])),fetches:new Map(),uploads:new Set(),queue:Promise.resolve(),busy:true,error:null,detail:'',lastChecked:null,needsReconcile:true,retry:null,closed:false,failed:false};
+    const ctx={acc,host:null,cache,review:this.store.nativeReview?.(acc.id)||null,conflictCopies:this.store.countFileEvents?.(acc.id,'conflictCopy',new Date(Date.now()-7*86400000).toISOString())||0,remote:this.transport(acc),items:new Map(this.store.nativeItems(acc.id).map(i=>[i.key,i])),deletions:new Map(this.store.nativeDeletions(acc.id).map(op=>[op.id,op])),fetches:new Map(),uploads:new Set(),queue:Promise.resolve(),busy:true,error:null,detail:'',lastChecked:null,needsReconcile:true,retry:null,closed:false,failed:false};
     this.contexts.set(acc.id,ctx);
     ctx.ready=(async()=>{try{if(await missingRoot(acc.native.root))throw new Error('err.nativeRootMissing');await mkdir(cache,{recursive:true,mode:0o700});if(this.closed||ctx.closed)throw new Error('err.nativeStopped');ctx.host=new NativeHost(this.binary);
       ctx.host.on('event',event=>this.event(ctx,event).catch(error=>this.recordError(ctx,error)));
@@ -49,7 +50,7 @@ export class NativeProviders {
     if(ctx.retryAt&&Date.now()<ctx.retryAt)return;ctx.retryAt=null;
     const due=ctx.needsReconcile||!ctx.lastChecked||Date.now()-ctx.lastChecked>=60000;
     if(!ctx.changed&&!due&&![...ctx.deletions.values()].some(op=>!op.awaitingConfirmation||op.confirmed))return;
-    await this.serial(ctx,async()=>{ctx.changed=false;await finishDeletions(this,ctx);await this.scan(ctx);if(due)await this.reconcile(ctx);});
+    await this.serial(ctx,async()=>{ctx.changed=false;await finishDeletions(this,ctx);await this.scan(ctx);if(due){await this.reconcile(ctx);await this.resolveConflicts(ctx);}});
   }
   recordError(ctx,error){ctx.needsReconcile=true;if(error.message==='err.canceled')return;if(retryableNativeError(error)){ctx.retry=error;
     // The transport already retried a temporary Dropbox failure; back off before the next cycle.
@@ -66,7 +67,7 @@ export class NativeProviders {
   async refresh(acc){
     const ctx=await this.start(acc);if(acc.native?.resetting)throw new Error('err.reset');
     if(ctx.refreshing){ctx.refreshAgain=true;return ctx.refreshing;}ctx.suspended=false;
-    const refresh=(async()=>{do{ctx.refreshAgain=false;await this.serial(ctx,async()=>{await finishDeletions(this,ctx);await this.scan(ctx);await this.reconcile(ctx);});}while(ctx.refreshAgain&&!ctx.closed&&!ctx.suspended&&!this.paused);return this.status(acc);})();ctx.refreshing=refresh;
+    const refresh=(async()=>{do{ctx.refreshAgain=false;await this.serial(ctx,async()=>{await finishDeletions(this,ctx);await this.scan(ctx);await this.reconcile(ctx);await this.resolveConflicts(ctx);});}while(ctx.refreshAgain&&!ctx.closed&&!ctx.suspended&&!this.paused);return this.status(acc);})();ctx.refreshing=refresh;
     try{return await refresh;}catch(error){if(retryableNativeError(error))return this.status(acc);throw error;}finally{if(ctx.refreshing===refresh)ctx.refreshing=null;}
   }
   async collect(ctx,rules=ctx.acc.settings.rules){
@@ -198,7 +199,14 @@ export class NativeProviders {
         const committed=await ctx.host.request('commit',{path:relative,previousIdentity:known?.identity||'',identity:nextIdentity,stamp:snapshot.stamp});this.save(ctx,{...item,identity:committed.committed?nextIdentity:item.identity,status:committed.committed?'cached':'dirty'});ctx.needsReconcile=true;this.log(ctx,item,'upload','upload');
       }catch(error){error.nativePath||=relative;error.nativeCommand||='upload';
         // Only a real version conflict stops uploads; quota, name and temporary errors keep the file dirty for the next cycle.
-        if(known)this.save(ctx,{...known,status:error.message==='err.nativeConflict'&&error.versionConflict!==false?'conflict':'dirty'});throw error;}
+        if(known)this.save(ctx,{...known,status:error.message==='err.nativeConflict'&&error.versionConflict!==false?'conflict':'dirty'});
+        // One file in a version conflict must not stop every other upload. A new local file whose
+        // name is already taken in Dropbox is tracked as a conflict and becomes a conflict copy.
+        if(error.versionConflict){
+          if(!known){const remote=await ctx.remote.metadata(relative).catch(()=>null);if(remote?.kind==='file'){const entry={...remote,key:randomUUID(),path:relative,status:'conflict'};entry.identity=identity(entry);this.save(ctx,entry);}}
+          this.log(ctx,{path:relative,kind:'file',size:known?.size},'upload','upload','failed','err.nativeConflict');ctx.needsReconcile=true;continue;
+        }
+        throw error;}
       finally{await ctx.host.request('transfer',{path:relative,busy:false}).catch(()=>{});await unlink(file).catch(()=>{});}
     }
   }
@@ -233,6 +241,20 @@ export class NativeProviders {
         const affected=[...ctx.items.values()].filter(i=>contains(current.path,i.path));for(const item of affected){const state=await ctx.host.request('inspect',{path:item.path});const renameOnly=item.status==='pendingRename'&&!state.dirtyBytes&&state.size===item.size&&Math.abs(state.modified-item.modified)<=1000;if(state.exists&&((!state.inSync&&!renameOnly)||state.dirtyBytes))throw new Error('err.nativeConflict');}
         {const target=event.target.replaceAll('\\','/');if(!supported(target))throw new Error('err.mapping');if(!effectivePolicy(target,ctx.acc.settings.rules).selected&&!ctx.acc.settings.rules[current.path]?.selected)throw new Error('err.nativeSelection');const moved=await ctx.remote.move(current,target);this.log(ctx,current,'rename','upload','succeeded','',target);for(const item of affected){const changed={...item,...(item.key===current.key?moved:{}),path:target+item.path.slice(current.path.length),status:'pendingRename'};changed.pendingIdentity=identity(changed);this.save(ctx,changed);}const rules={};for(const [p,rule]of Object.entries(ctx.acc.settings.rules))rules[contains(current.path,p)?target+p.slice(current.path.length):p]=rule;ctx.acc.settings.rules=rules;await this.persist();}
       });await ctx.host.request('ack',{request:event.request,allow:true});}catch(error){this.recordError(ctx,error);await ctx.host.request('ack',{request:event.request,allow:false}).catch(()=>{});}
+    }
+  }
+  // Roadmap 1B: turn real version conflicts into conflict copies. Uses the cloud listing of the
+  // reconcile that just ran; nothing here overwrites or deletes data that is not already in Dropbox.
+  async resolveConflicts(ctx){
+    if(!ctx.remoteCatalog)return;
+    const candidates=[...ctx.items.values()].filter(i=>i.status==='conflict'&&i.kind==='file'&&!blockedPath(ctx,i.path)&&!deleting(ctx,i.path));if(!candidates.length)return;
+    const canonical=value=>value.normalize('NFC').toLowerCase(),byPath=new Map(ctx.remoteCatalog.map(remote=>[canonical(remote.path),remote]));
+    for(const item of candidates){
+      ctx.operation?.signal.throwIfAborted();
+      const remote=byPath.get(canonical(item.path)),state=await ctx.host.request('inspect',{path:item.path});
+      if(!resolvable(item,state,remote))continue;
+      try{const result=await resolveConflict(this,ctx,item,{remote,state});if(result.resolved)ctx.conflictCopies=(ctx.conflictCopies||0)+1;}
+      catch(error){error.nativePath||=item.path;error.nativeCommand||='upload';throw error;}
     }
   }
   async setReview(ctx,review){ctx.review=review;if(review)this.store.saveNativeReview?.(ctx.acc.id,review);else this.store.deleteNativeReview?.(ctx.acc.id);}

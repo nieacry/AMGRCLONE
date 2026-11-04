@@ -330,6 +330,14 @@ static JsonObject handleCommand(JsonObject const& cmd){
     if(action=="moveLocal"){auto target=full(str(cmd,L"target"));wincheck(MoveFileExW(ioPath(p).c_str(),ioPath(target).c_str(),MOVEFILE_WRITE_THROUGH));}
     else{auto attr=GetFileAttributesW(ioPath(p).c_str());if(attr&FILE_ATTRIBUTE_DIRECTORY)wincheck(RemoveDirectoryW(ioPath(p).c_str()));else wincheck(DeleteFileW(ioPath(p).c_str()));}return result;
   }
+  // Conflict resolution (roadmap 1.6): these local edits were already uploaded as a conflict copy and
+  // kept in quarantine. Removing the placeholder lets the cloud version come back in its place. The host
+  // deletes it itself, so the NOTIFY_DELETE callback acknowledges the deletion; only an owned file qualifies.
+  if(action=="discard"){
+    std::lock_guard<std::mutex> lock(mutationMutex);auto p=full(str(cmd,L"path"));{std::unique_ptr<Handle> h(attributes(p));requireOwned(h->h,str(cmd,L"identity"));}
+    auto attr=GetFileAttributesW(ioPath(p).c_str());if(attr==INVALID_FILE_ATTRIBUTES)winrt::throw_last_error();if(attr&FILE_ATTRIBUTE_DIRECTORY)winrt::throw_hresult(E_INVALIDARG);
+    wincheck(DeleteFileW(ioPath(p).c_str()));return result;
+  }
   if(action=="unregister"){std::lock_guard<std::mutex> lock(mutationMutex);if(!fs::is_empty(root))winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY));unregisterRoot();return result;}
   winrt::throw_hresult(E_INVALIDARG);
 }
