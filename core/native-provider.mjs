@@ -10,13 +10,14 @@ import {dropboxHash} from './dropbox-transport.mjs';
 import {nativeAvailabilityStates,nativeFileStatus} from './native-availability.mjs';
 import {skippableMapping,mappingBlocks,blockedPath,containsSkipped} from './native-skips.mjs';
 import {setImmediate as yieldToEventLoop} from 'node:timers/promises';
+import {exceedsThreshold,fullyLocal,quarantineFile,pruneQuarantine,reviewSummary,quarantineRoot} from './deletion-guard.mjs';
 
 const order=(a,b)=>a.path.split('/').length-b.path.split('/').length||a.path.localeCompare(b.path);
 export function selectedRoots(rules){return Object.keys(rules).filter(p=>rules[p].selected).sort((a,b)=>a.length-b.length).filter((p,_i,all)=>!all.some(parent=>parent!==p&&contains(parent,p)));}
 function supported(relative){validateLocalMapping(relative,'win32');return !relative.split('/').some(p=>p.toLowerCase()==='.amg-backups'||p.startsWith('.amg-access-'));}
 export class NativeProviders {
-  constructor({binary,dataDir,store,transport,persist}){this.binary=binary;this.dataDir=dataDir;this.store=store;this.transport=transport;this.persist=persist;this.contexts=new Map();this.closed=false;this.paused=false;}
-  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0);return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts}};}
+  constructor({binary,dataDir,store,transport,persist,onReview}){this.binary=binary;this.dataDir=dataDir;this.store=store;this.transport=transport;this.persist=persist;this.onReview=onReview;this.contexts=new Map();this.closed=false;this.paused=false;}
+  status(acc){const ctx=this.contexts.get(acc.id);if(!acc.native?.enabled)return {enabled:false};if(!ctx)return {enabled:true,root:acc.native.root,status:'error',error:'err.nativeStopped',lastSync:acc.native.lastSync||null,pending:0,transfers:0};const items=[...ctx.items.values()].filter(item=>!blockedPath(ctx,item.path)),orphans=items.filter(i=>i.status==='orphaned').length,conflicts=items.filter(i=>i.status==='conflict').length,awaiting=[...(ctx.deletions?.values()||[])].filter(op=>op.awaitingConfirmation&&!op.confirmed),pending=items.filter(i=>i.status==='dirty').length+(ctx.deletions?.size||0)-awaiting.length;return {enabled:true,shellRegistered:ctx.registration?.shellRegistered,canDisconnectUninitialized:!!ctx.failed&&!ctx.registration,registered:!!acc.native.registered,initializationFailed:!!ctx.failed&&!ctx.registration,skippedFiles:ctx.mappingSkips?.size||0,catalogItems:ctx.items.size,pendingDeletions:ctx.deletions?.size||0,canChangeRoot:!!ctx.failed&&ctx.items.size===0&&!ctx.deletions?.size,root:acc.native.root,status:ctx.error||conflicts||orphans||acc.native.resetting?'error':ctx.busy||ctx.fetches.size?'syncing':ctx.retry||ctx.suspended?'pending':pending?'syncing':ctx.lastChecked?'current':'idle',error:ctx.error||(acc.native.resetting?'err.reset':conflicts?'err.nativeConflict':orphans?'err.nativeOrphan':null),detail:ctx.detail||'',progress:ctx.progress||null,canceled:!!ctx.suspended,pending,transfers:ctx.fetches.size,lastChecked:ctx.lastChecked,lastSync:acc.native.lastSync||null,waiting:ctx.retry?.nativePath|| (ctx.retry?'':undefined),counts:{online:items.filter(i=>i.kind==='file'&&i.status==='online').length,local:items.filter(i=>i.kind==='file'&&['cached','pinned'].includes(i.status)).length,conflicts},review:ctx.review&&!ctx.review.approved?{id:ctx.review.id,created:ctx.review.created,...reviewSummary(ctx.review.items)}:null,confirmations:awaiting.map(op=>({id:op.id,path:op.path,action:op.action,count:(op.remoteBaseline||op.items).length,preparedAt:op.preparedAt}))};}
   save(ctx,item){ctx.items.set(item.key,item);this.store.saveNativeItem(ctx.acc.id,item);return item;}
   async itemStates(acc,paths){
     const ctx=this.contexts.get(acc.id);if(!ctx||ctx.closed||ctx.failed||!ctx.host||acc.native?.resetting)return nativeAvailabilityStates([],paths);
@@ -28,7 +29,7 @@ export class NativeProviders {
   async start(acc){
     const previous=this.contexts.get(acc.id);if(previous){if(!previous.failed)return previous.ready;await previous.host?.close();this.contexts.delete(acc.id);}
     const cache=path.join(this.dataDir,'native-cache',acc.id);
-    const ctx={acc,host:null,cache,remote:this.transport(acc),items:new Map(this.store.nativeItems(acc.id).map(i=>[i.key,i])),deletions:new Map(this.store.nativeDeletions(acc.id).map(op=>[op.id,op])),fetches:new Map(),uploads:new Set(),queue:Promise.resolve(),busy:true,error:null,detail:'',lastChecked:null,needsReconcile:true,retry:null,closed:false,failed:false};
+    const ctx={acc,host:null,cache,review:this.store.nativeReview?.(acc.id)||null,remote:this.transport(acc),items:new Map(this.store.nativeItems(acc.id).map(i=>[i.key,i])),deletions:new Map(this.store.nativeDeletions(acc.id).map(op=>[op.id,op])),fetches:new Map(),uploads:new Set(),queue:Promise.resolve(),busy:true,error:null,detail:'',lastChecked:null,needsReconcile:true,retry:null,closed:false,failed:false};
     this.contexts.set(acc.id,ctx);
     ctx.ready=(async()=>{try{if(await missingRoot(acc.native.root))throw new Error('err.nativeRootMissing');await mkdir(cache,{recursive:true,mode:0o700});if(this.closed||ctx.closed)throw new Error('err.nativeStopped');ctx.host=new NativeHost(this.binary);
       ctx.host.on('event',event=>this.event(ctx,event).catch(error=>this.recordError(ctx,error)));
@@ -37,6 +38,7 @@ export class NativeProviders {
       if(!(acc.native.resetting&&acc.native.resetMode==='keepDownloaded'))await finishDeletions(this,ctx,{recover:true}).catch(error=>this.recordError(ctx,error));
       ctx.watcher=watch(acc.native.root,{recursive:true},()=>{ctx.changed=true;});ctx.watcher.on('error',error=>this.recordError(ctx,error));
       ctx.timer=setInterval(()=>this.background(ctx).catch(()=>{}),5000);
+      if(this.dataDir)pruneQuarantine({dataDir:this.dataDir,accountId:acc.id}).catch(()=>{});
       ctx.busy=false;return ctx;
     }catch(error){ctx.busy=false;ctx.failed=true;this.recordError(ctx,error);throw error;}})();
     return ctx.ready;
@@ -46,7 +48,7 @@ export class NativeProviders {
     if(ctx.busy||ctx.closed||ctx.suspended||this.paused||ctx.acc.native?.resetting)return;
     if(ctx.retryAt&&Date.now()<ctx.retryAt)return;ctx.retryAt=null;
     const due=ctx.needsReconcile||!ctx.lastChecked||Date.now()-ctx.lastChecked>=60000;
-    if(!ctx.changed&&!due&&!ctx.deletions.size)return;
+    if(!ctx.changed&&!due&&![...ctx.deletions.values()].some(op=>!op.awaitingConfirmation||op.confirmed))return;
     await this.serial(ctx,async()=>{ctx.changed=false;await finishDeletions(this,ctx);await this.scan(ctx);if(due)await this.reconcile(ctx);});
   }
   recordError(ctx,error){ctx.needsReconcile=true;if(error.message==='err.canceled')return;if(retryableNativeError(error)){ctx.retry=error;
@@ -97,11 +99,21 @@ export class NativeProviders {
   async reconcile(ctx){
     const rules=structuredClone(ctx.acc.settings.rules),listing=await this.collect(ctx,rules),seen=new Set(),byRemoteId=new Map([...ctx.items.values()].map(item=>[item.remoteId,item]));ctx.operation?.signal.throwIfAborted();ctx.progress={phase:'placeholders',completed:0,total:listing.length};
     ctx.remoteCatalog=listing;
+    // Items whose Dropbox ID disappeared, by path: a file deleted and created again under the same
+    // name gets a new ID and must replace the old placeholder, not look like a conflict plus a deletion.
+    const listedIds=new Set(listing.map(remote=>remote.remoteId)),canonical=value=>value.normalize('NFC').toLowerCase();
+    const vanished=new Map([...ctx.items.values()].filter(item=>item.remoteId&&!listedIds.has(item.remoteId)&&!['orphaned','conflict'].includes(item.status)).map(item=>[canonical(item.path),item]));
     for(const remote of listing){
       ctx.operation?.signal.throwIfAborted();ctx.progress.completed++;
       if(blockedPath(ctx,remote.path))continue;
       if(deleting(ctx,remote.path))continue;
-      let existing=byRemoteId.get(remote.remoteId);let item=existing?{...existing}: {...remote,key:randomUUID(),status:'creating'};
+      let existing=byRemoteId.get(remote.remoteId);
+      if(!existing){const replaced=vanished.get(canonical(remote.path));
+        if(replaced&&replaced.kind===remote.kind&&replaced.path===remote.path&&!seen.has(replaced.key)){const before=await ctx.host.request('inspect',{path:remote.path});
+          if(before.exists&&before.placeholder&&before.identity===replaced.identity&&before.inSync&&!before.dirtyBytes){
+            if(fullyLocal(before))await this.quarantine(ctx,replaced);
+            existing=replaced;vanished.delete(canonical(remote.path));}}}
+      let item=existing?{...existing}: {...remote,key:randomUUID(),status:'creating'};
       seen.add(item.key);const priorIdentity=existing?.identity;
       if(existing&&existing.path!==remote.path){
         const atNew=await ctx.host.request('inspect',{path:remote.path});
@@ -134,16 +146,35 @@ export class NativeProviders {
     }
     // A changed selection invalidates this snapshot for removals; the queued refresh will use the new rules.
     if(JSON.stringify(rules)!==JSON.stringify(ctx.acc.settings.rules)){ctx.needsReconcile=true;ctx.refreshAgain=true;return;}
+    // Removals: decide on the whole set first, then act. Edited local data is never removed (conflict).
+    const removals=[];
     for(const item of [...ctx.items.values()].filter(i=>!seen.has(i.key)&&i.status!=='orphaned'&&!deleting(ctx,i.path)&&!containsSkipped(ctx,i.path)).sort((a,b)=>order(b,a))){
       ctx.operation?.signal.throwIfAborted();
       const state=await ctx.host.request('inspect',{path:item.path});
-      if(state.exists){if(!state.placeholder||state.identity!==item.identity||!state.inSync||state.dirtyBytes){this.save(ctx,{...item,status:'conflict'});continue;}await ctx.host.request('remove',{path:item.path,identity:item.identity});}
+      if(state.exists&&(!state.placeholder||state.identity!==item.identity||!state.inSync||state.dirtyBytes)){this.save(ctx,{...item,status:'conflict'});continue;}
+      removals.push({item,state,deselected:!effectivePolicy(item.path,rules).selected,downloaded:item.kind==='file'&&fullyLocal(state)});
+    }
+    // Deselected folders still exist in Dropbox: removing them locally loses nothing. Items deleted in
+    // Dropbox that still exist here count against the mass-deletion threshold and wait for this user.
+    const cloudDeleted=removals.filter(r=>!r.deselected&&r.state.exists),approved=new Set(ctx.review?.approved?ctx.review.keys:[]);
+    const unapproved=cloudDeleted.filter(r=>!approved.has(r.item.key)),held=new Set();
+    if(exceedsThreshold(unapproved.length,ctx.items.size)){
+      const keys=unapproved.map(r=>r.item.key).sort();for(const key of keys)held.add(key);
+      if(!ctx.review||ctx.review.approved||ctx.review.keys.join('|')!==keys.join('|')){
+        const review={id:randomUUID(),created:Date.now(),keys,items:unapproved.map(({item,downloaded})=>({key:item.key,path:item.path,kind:item.kind,size:item.size||0,remoteId:item.remoteId,rev:item.rev||'',downloaded}))};
+        await this.setReview(ctx,review);this.onReview?.(ctx.acc,{inbound:review});
+      }
+    }
+    for(const {item,state,downloaded,deselected} of removals){
+      ctx.operation?.signal.throwIfAborted();if(held.has(item.key))continue;
+      if(state.exists){if(downloaded&&!deselected)await this.quarantine(ctx,item);await ctx.host.request('remove',{path:item.path,identity:item.identity});}
       ctx.items.delete(item.key);this.store.deleteNativeItem(ctx.acc.id,item.key);this.log(ctx,item,'delete','download');
     }
+    if(!held.size&&ctx.review)await this.setReview(ctx,null);
     for(const item of ctx.items.values()){ctx.operation?.signal.throwIfAborted();if(item.kind==='folder'&&item.status!=='conflict'&&item.status!=='orphaned'&&!deleting(ctx,item.path)&&!blockedPath(ctx,item.path))await ctx.host.request('folderAvailability',{path:item.path,identity:item.identity,mode:effectivePolicy(item.path,rules).mode});}
     ctx.lastChecked=Date.now();ctx.checkedThisRun=true;ctx.needsReconcile=!!ctx.retry;
   }
-  async finishCheck(ctx){if(ctx.checkedThisRun&&!ctx.acc.native.resetting&&!ctx.deletions?.size&&!ctx.error&&!ctx.retry&&!ctx.fetches.size&&!ctx.uploads.size&&![...ctx.items.values()].some(i=>!blockedPath(ctx,i.path)&&['dirty','conflict','creating','pendingRename','orphaned'].includes(i.status))){ctx.acc.native.lastSync=ctx.lastChecked;await this.persist();}}
+  async finishCheck(ctx){if(ctx.checkedThisRun&&!ctx.acc.native.resetting&&!ctx.review&&!ctx.deletions?.size&&!ctx.error&&!ctx.retry&&!ctx.fetches.size&&!ctx.uploads.size&&![...ctx.items.values()].some(i=>!blockedPath(ctx,i.path)&&['dirty','conflict','creating','pendingRename','orphaned'].includes(i.status))){ctx.acc.native.lastSync=ctx.lastChecked;await this.persist();}}
   async scan(ctx){
     const paths=[],byPath=new Map([...ctx.items.values()].map(item=>[item.path,item]));const walk=async relative=>{ctx.operation?.signal.throwIfAborted();for(const info of await readdir(path.join(ctx.acc.native.root,...relative.split('/')),{withFileTypes:true})){ctx.operation?.signal.throwIfAborted();const child=relative?relative+'/'+info.name:info.name;if(info.isSymbolicLink())throw new Error('err.link');paths.push(child);if(info.isDirectory())await walk(child);}};await walk('');
     for(const relative of paths.sort((a,b)=>a.split('/').length-b.split('/').length)){
@@ -203,6 +234,42 @@ export class NativeProviders {
         {const target=event.target.replaceAll('\\','/');if(!supported(target))throw new Error('err.mapping');if(!effectivePolicy(target,ctx.acc.settings.rules).selected&&!ctx.acc.settings.rules[current.path]?.selected)throw new Error('err.nativeSelection');const moved=await ctx.remote.move(current,target);this.log(ctx,current,'rename','upload','succeeded','',target);for(const item of affected){const changed={...item,...(item.key===current.key?moved:{}),path:target+item.path.slice(current.path.length),status:'pendingRename'};changed.pendingIdentity=identity(changed);this.save(ctx,changed);}const rules={};for(const [p,rule]of Object.entries(ctx.acc.settings.rules))rules[contains(current.path,p)?target+p.slice(current.path.length):p]=rule;ctx.acc.settings.rules=rules;await this.persist();}
       });await ctx.host.request('ack',{request:event.request,allow:true});}catch(error){this.recordError(ctx,error);await ctx.host.request('ack',{request:event.request,allow:false}).catch(()=>{});}
     }
+  }
+  async setReview(ctx,review){ctx.review=review;if(review)this.store.saveNativeReview?.(ctx.acc.id,review);else this.store.deleteNativeReview?.(ctx.acc.id);}
+  // Copies the only local copy of a file before its placeholder is removed or replaced.
+  async quarantine(ctx,item){
+    const target=await quarantineFile({dataDir:this.dataDir,accountId:ctx.acc.id,root:ctx.acc.native.root,relative:item.path});
+    this.log(ctx,item,'quarantine','none','succeeded','',path.relative(quarantineRoot(this.dataDir,ctx.acc.id),target).split(path.sep).join('/'));return target;
+  }
+  quarantinePath(acc){return quarantineRoot(this.dataDir,acc.id);}
+  // The user's decision on a pending mass deletion. Inbound (from Dropbox): 'apply' removes the
+  // local copies (downloaded files go to quarantine), 'restore' brings the files back in Dropbox.
+  // Outbound (a folder deleted in Explorer): 'confirm' deletes it in Dropbox, 'cancel' restores it here.
+  async decide(acc,action,operationId){
+    const ctx=await this.start(acc);if(acc.native?.resetting)throw new Error('err.reset');
+    if(action==='apply'||action==='restore'){
+      const review=ctx.review;if(!review||review.approved)return this.status(acc);
+      if(action==='apply'){await this.setReview(ctx,{...review,approved:true});ctx.needsReconcile=true;return this.refresh(acc);}
+      await this.serial(ctx,async()=>{
+        const files=review.items.filter(i=>i.kind==='file'&&i.rev),folders=review.items.filter(i=>i.kind==='folder').sort(order);let failed=0;
+        for(const item of files){ctx.operation?.signal.throwIfAborted();try{await ctx.remote.restore(item);this.log(ctx,item,'restore','upload');}catch(error){if(error.message==='err.canceled')throw error;failed++;this.log(ctx,item,'restore','upload','failed',error.message?.startsWith('err.')?error.message:'err.operation');}}
+        for(const item of folders){ctx.operation?.signal.throwIfAborted();try{await ctx.remote.createFolder(item.path);}catch(error){if(error.message==='err.canceled')throw error;/* Already recreated by its files. */}}
+        // Anything that could not be restored is raised again by the next check if it still exceeds the threshold.
+        await this.setReview(ctx,null);ctx.needsReconcile=true;if(failed)ctx.detail=String(failed);
+      },{user:true});
+      return this.refresh(acc);
+    }
+    if(action==='confirm'||action==='cancel'){
+      const op=ctx.deletions.get(operationId);if(!op)return this.status(acc);
+      await this.serial(ctx,async()=>{
+        if(action==='confirm'){const next={...op,confirmed:true};ctx.deletions.set(op.id,next);this.store.saveNativeDeletion(ctx.acc.id,next);await finishDeletions(this,ctx);return;}
+        const current=op.items.find(i=>i.path===op.path)||{kind:'folder',size:0};
+        this.store.cancelNativeDeletion(ctx.acc.id,op,{path:op.path,kind:current.kind,size:current.size,action:op.action,direction:'none',status:'failed',detail:'err.nativeDeleteCanceled'});
+        ctx.deletions.delete(op.id);ctx.needsReconcile=true;
+      },{user:true});
+      return this.refresh(acc);
+    }
+    throw new Error('err.settings');
   }
   async finishRename(ctx,item){await ctx.host.request('markMetadata',{path:item.path,previousIdentity:item.identity,identity:item.pendingIdentity||item.identity,size:item.size,modified:item.modified,directory:item.kind==='folder'});const next={...item,identity:item.pendingIdentity||item.identity,status:'cached'};delete next.pendingIdentity;this.save(ctx,next);}
   async detachUninitialized(acc){

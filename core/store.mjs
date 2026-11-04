@@ -19,6 +19,7 @@ export class SyncStore {
         this.db.exec(`CREATE TABLE IF NOT EXISTS native_items(account_id TEXT NOT NULL,item_key TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(account_id,item_key));
           CREATE TABLE IF NOT EXISTS marker_cleanup(account_id TEXT NOT NULL,job_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(account_id,job_id));
           CREATE TABLE IF NOT EXISTS native_deletions(account_id TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(account_id,id));
+          CREATE TABLE IF NOT EXISTS native_reviews(account_id TEXT NOT NULL PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS file_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,account_id TEXT NOT NULL,time TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL,action TEXT NOT NULL,direction TEXT NOT NULL,status TEXT NOT NULL,size INTEGER,detail TEXT NOT NULL DEFAULT '',target TEXT NOT NULL DEFAULT '');
           CREATE INDEX IF NOT EXISTS file_events_account_seq ON file_events(account_id,seq DESC);
           CREATE INDEX IF NOT EXISTS file_events_account_time ON file_events(account_id,time,seq);
@@ -60,7 +61,7 @@ export class SyncStore {
     } this.db.exec('COMMIT'); } catch(error) {this.db.exec('ROLLBACK');throw error;}
     return moves;
   }
-  reset(){this.db.exec('BEGIN; DELETE FROM file_events; DELETE FROM native_deletions; DELETE FROM marker_cleanup; DELETE FROM native_items; DELETE FROM runs; DELETE FROM jobs; DELETE FROM items; COMMIT; VACUUM');}
+  reset(){this.db.exec('BEGIN; DELETE FROM file_events; DELETE FROM native_reviews; DELETE FROM native_deletions; DELETE FROM marker_cleanup; DELETE FROM native_items; DELETE FROM runs; DELETE FROM jobs; DELETE FROM items; COMMIT; VACUUM');}
   retireJobs(accountId){this.db.prepare("UPDATE jobs SET status='retired',generation=generation+1 WHERE account_id=? AND status<>'retired'").run(accountId);}
   markerReceipt(accountId,jobId){const row=this.db.prepare('SELECT data FROM marker_cleanup WHERE account_id=? AND job_id=?').get(accountId,jobId);return row?JSON.parse(row.data):null;}
   markerReceipts(accountId){return this.db.prepare('SELECT data FROM marker_cleanup WHERE account_id=?').all(accountId).map(row=>JSON.parse(row.data));}
@@ -73,6 +74,10 @@ export class SyncStore {
   fileEvents(accountId,{before=0,search='',status='all',limit=100}={}){const rows=this.db.prepare("SELECT seq,id,time,path,kind,action,direction,status,size,detail,target FROM file_events WHERE account_id=? AND (?=0 OR seq<?) AND (?='' OR instr(lower(path),lower(?))>0 OR instr(lower(target),lower(?))>0) AND (?='all' OR status=?) ORDER BY seq DESC LIMIT ?").all(accountId,before,before,search,search,search,status,status,limit+1);return {entries:rows.slice(0,limit),next:rows.length>limit?rows[limit-1].seq:null};}
   nativeDeletions(accountId){return this.db.prepare('SELECT data FROM native_deletions WHERE account_id=?').all(accountId).map(row=>JSON.parse(row.data));}
   saveNativeDeletion(accountId,operation){this.db.prepare('INSERT INTO native_deletions(account_id,id,data) VALUES (?,?,?) ON CONFLICT(account_id,id) DO UPDATE SET data=excluded.data').run(accountId,operation.id,JSON.stringify(operation));}
+  // A cloud-side mass deletion waiting for this computer's user to decide (one per account).
+  nativeReview(accountId){const row=this.db.prepare('SELECT data FROM native_reviews WHERE account_id=?').get(accountId);return row?JSON.parse(row.data):null;}
+  saveNativeReview(accountId,review){this.db.prepare('INSERT INTO native_reviews(account_id,data) VALUES (?,?) ON CONFLICT(account_id) DO UPDATE SET data=excluded.data').run(accountId,JSON.stringify(review));}
+  deleteNativeReview(accountId){this.db.prepare('DELETE FROM native_reviews WHERE account_id=?').run(accountId);}
   deleteNativeDeletion(accountId,id){this.db.prepare('DELETE FROM native_deletions WHERE account_id=? AND id=?').run(accountId,id);}
   cancelNativeDeletion(accountId,operation,event){this.db.exec('BEGIN');try{this.addFileEvent(accountId,{...event,id:operation.id+':canceled'});this.deleteNativeDeletion(accountId,operation.id);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}}
   finishNativeDeletion(accountId,operation){this.db.exec('BEGIN');try{for(const item of operation.items){this.deleteNativeItem(accountId,item.key);this.addFileEvent(accountId,{id:operation.id+':'+item.key,path:item.path,kind:item.kind,size:item.size,action:operation.action==='recycle'?'recycle':'delete',direction:item.remoteId?'upload':'none'});}this.deleteNativeDeletion(accountId,operation.id);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}}

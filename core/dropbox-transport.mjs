@@ -106,6 +106,8 @@ export class DropboxTransport {
       throw error;
     }
   }
+  // Brings back a deleted file at its old path, at the revision this computer last knew.
+  async restore(item){return entry(await this.request('files/restore',{path:remotePath(item.path),rev:item.rev}));}
   async createFolder(relative){return entry((await this.request('files/create_folder_v2',{path:remotePath(relative),autorename:false})).metadata);}
   async remove(item){await this.request('files/delete_v2',{path:'id:'+item.remoteId.replace(/^id:/,''),...(item.rev?{parent_rev:item.rev}:{})});}
   async move(item,target){return entry((await this.request('files/move_v2',{from_path:'id:'+item.remoteId.replace(/^id:/,''),to_path:remotePath(target),autorename:false,allow_shared_folder:false})).metadata);}

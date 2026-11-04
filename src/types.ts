@@ -4,7 +4,9 @@ export type Item={path:string;name:string;kind:'file'|'folder';size:number;modif
 export type Rule={selected:boolean;mode:Mode;kind:Item['kind'];itemId?:string};
 export type Settings={localRoot:string;rules:Record<string,Rule>};
 export type Job={path:string;status:string;lastSuccess:string|null};
-export type NativeState={enabled:boolean;shellRegistered?:boolean;canChangeRoot?:boolean;canDisconnectUninitialized?:boolean;registered?:boolean;initializationFailed?:boolean;catalogItems?:number;pendingDeletions?:number;skippedFiles?:number;root?:string;status?:string;progress?:{phase:'listing'|'placeholders';completed:number;total?:number}|null;canceled?:boolean;error?:string;detail?:string;lastChecked?:number;lastSync?:number|null;waiting?:string;pending?:number;transfers?:number;counts?:{online:number;local:number;conflicts:number}};
+export type NativeState={enabled:boolean;shellRegistered?:boolean;canChangeRoot?:boolean;canDisconnectUninitialized?:boolean;registered?:boolean;initializationFailed?:boolean;catalogItems?:number;pendingDeletions?:number;skippedFiles?:number;root?:string;status?:string;progress?:{phase:'listing'|'placeholders';completed:number;total?:number}|null;canceled?:boolean;error?:string;detail?:string;lastChecked?:number;lastSync?:number|null;waiting?:string;pending?:number;transfers?:number;counts?:{online:number;local:number;conflicts:number};review?:Review|null;confirmations?:Confirmation[]};
+export type Review={id:string;created:number;count:number;files:number;downloaded:number;bytes:number;sample:string[]};
+export type Confirmation={id:string;path:string;action:'delete'|'recycle';count:number;preparedAt:number};
 export type Preferences={autoStart:boolean;startMinimized:boolean;pauseSync:boolean};
 export type Drive={absolutePath?:string;id:string;accountId:string;path:string;letter:string;status:string};
 export type Account={id:string;name:string;scope:'personal'|'team';accountType?:'business'|'personal';settings:Settings;jobs:Job[];scheduleMinutes:number;paused:boolean;nextRun:number|null;native?:NativeState;maintenance?:{total:number;removed:number;pending:number}};
@@ -28,6 +30,7 @@ export interface Bridge{
   resetApp(confirmed:boolean):Promise<State>;cleanupLegacy(id:string):Promise<State>;
   enableNativeRoot(id:string):Promise<State>;chooseNativeRoot(id:string):Promise<State>;refreshNative(id:string):Promise<State>;nativeItem(id:string,path:string):Promise<string|null>;
   nativeAvailability(id:string,path:string,mode:Mode):Promise<State>;
+  nativeReview(id:string,action:'apply'|'restore'|'confirm'|'cancel',operationId?:string):Promise<State>;openQuarantine(id:string):Promise<void>;
   nativeItems(id:string,paths:string[]):Promise<Record<string,string>>;
   chooseDriveFolder(id:string):Promise<string|null>;driveLetters():Promise<{drives:{letter:string;available:boolean;target?:string}[]}>;createDrive(id:string,path:string,letter:string):Promise<State>;removeDrive(id:string):Promise<State>;
 }
